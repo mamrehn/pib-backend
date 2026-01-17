@@ -9,7 +9,7 @@ RUN set -xe \
     && apt-get update \
     && apt-get install -y python3-pip
 
-RUN pip install depthai==2.25.1.0
+RUN pip install depthai==2.31.0.0 opencv-python numpy blobconverter
 
 RUN cd ros2_ws && \
     source /opt/ros/humble/setup.bash && \
