@@ -28,12 +28,11 @@ except ImportError:
 # Format: "luxonis/model-name:variant"
 MODEL_SLUGS = {
     # Object Detection
-    "yolov8n": "luxonis/yolov8-nano:coco-512x288",
     "yolov6n": "luxonis/yolov6-nano:r2-coco-512x288",
     "yolov10n": "luxonis/yolov10-nano:coco-512x288",
     
-    # Face Detection
-    "face": "luxonis/scrfd:2.5g-kps-640x640",
+    # Face Detection (YuNet is reliable and well-supported)
+    "face": "luxonis/yunet:320x320",
     
     # Person Detection
     "person": "luxonis/scrfd-person-detection:25g-640x640",
@@ -56,7 +55,7 @@ MODEL_SLUGS = {
 }
 
 # Default models to download (most commonly used)
-DEFAULT_MODELS = ["yolov8n", "face", "person", "pose_yolo", "hand", "segmentation"]
+DEFAULT_MODELS = ["yolov6n", "face", "person", "pose_yolo", "hand", "segmentation"]
 
 
 def download_model(model_key: str, model_slug: str, verbose: bool = True) -> bool:
