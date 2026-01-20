@@ -82,11 +82,11 @@ def download_model(model_key: str, model_slug: str, verbose: bool = True) -> boo
     try:
         # Create model description with platform set for RVC2 (OAK-D Lite)
         model_desc = dai.NNModelDescription(model_slug)
-        model_desc.platform = dai.Platform.RVC2
+        model_desc.platform = "RVC2"  # Platform is a string, not enum
         
         # Get model path (this downloads if not cached)
-        # progressFormat can be: 'none', 'bar', 'percent'
-        model_path = dai.getModelFromZoo(model_desc, progressFormat='bar' if verbose else 'none')
+        # progressFormat can be: 'none', 'bar', 'percent', 'pretty', 'json'
+        model_path = dai.getModelFromZoo(model_desc, progressFormat='pretty' if verbose else 'none')
         
         if verbose:
             print(f"✓ Downloaded successfully!")
