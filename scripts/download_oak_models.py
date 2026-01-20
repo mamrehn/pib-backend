@@ -1,162 +1,169 @@
 #!/usr/bin/env python3
 """
-Pre-download all OAK-D Lite AI models for offline use.
+Pre-download OAK-D models from Luxonis Model Hub for offline use.
 
-This script downloads all models from the DepthAI model zoo and saves them
-to /opt/oak_models/ (or a custom directory). Models are cached by blobconverter,
-so running this script multiple times won't re-download existing models.
+This script uses DepthAI v3's NNModelDescription API to download and cache
+neural network models. The models will be automatically converted to the
+appropriate format for the target device (RVC2 for OAK-D Lite).
 
 Usage:
-    python3 download_oak_models.py                    # Download to /opt/oak_models/
-    python3 download_oak_models.py --output ./models  # Custom output directory
-    python3 download_oak_models.py --list             # List available models
+    python download_oak_models.py [--models MODEL1,MODEL2,...] [--all]
+
+Examples:
+    python download_oak_models.py --all
+    python download_oak_models.py --models yolov8n,yolov6n,face
 """
 
 import argparse
-import shutil
 import sys
 from pathlib import Path
 
 try:
-    import blobconverter
+    import depthai as dai
 except ImportError:
-    print("Error: blobconverter not installed. Run: pip install blobconverter")
+    print("ERROR: depthai not installed. Install with: pip install depthai")
     sys.exit(1)
 
-
-# Model registry - must match stereo.py
-AVAILABLE_MODELS = {
-    # ============== DETECTION MODELS ==============
-    "mobilenet-ssd": {
-        "zoo_name": "mobilenet-ssd",
-        "shaves": 6,
-        "description": "Fast object detection (MobileNet SSD)",
-    },
-    "yolo-v4-tiny": {
-        "zoo_name": "yolo-v4-tiny-tf",
-        "shaves": 6,
-        "description": "YOLOv4 Tiny - balanced speed/accuracy",
-    },
-    "tiny-yolo-v3": {
-        "zoo_name": "tiny-yolo-v3",
-        "shaves": 6,
-        "description": "Tiny YOLOv3 - fast detection",
-    },
-    "yolov6n": {
-        "zoo_name": "yolov6n_coco_640x640",
-        "shaves": 6,
-        "description": "YOLOv6 Nano - fast & accurate",
-    },
-    "yolov8n": {
-        "zoo_name": "yolov8n_coco_640x640",
-        "shaves": 6,
-        "description": "YOLOv8 Nano - latest YOLO",
-    },
-    "face-detection-retail-0004": {
-        "zoo_name": "face-detection-retail-0004",
-        "shaves": 6,
-        "description": "Face detection model",
-    },
+# DepthAI v3 Model Hub slugs for RVC2 devices (OAK-D Lite)
+# Format: "luxonis/model-name:variant"
+MODEL_SLUGS = {
+    # Object Detection
+    "yolov8n": "luxonis/yolov8-nano:coco-512x288",
+    "yolov6n": "luxonis/yolov6-nano:r2-coco-512x288",
+    "yolov10n": "luxonis/yolov10-nano:coco-512x288",
     
-    # ============== CLASSIFICATION MODELS ==============
-    "resnet50": {
-        "zoo_name": "resnet-50-pytorch",
-        "shaves": 6,
-        "description": "ResNet-50 image classification",
-    },
+    # Face Detection
+    "face": "luxonis/scrfd:2.5g-kps-640x640",
     
-    # ============== AGE/GENDER/EMOTION MODELS ==============
-    "age-gender": {
-        "zoo_name": "age-gender-recognition-retail-0013",
-        "shaves": 6,
-        "description": "Age and gender estimation",
-    },
-    "emotion-recognition": {
-        "zoo_name": "emotions-recognition-retail-0003",
-        "shaves": 6,
-        "description": "Facial emotion recognition",
-    },
+    # Person Detection
+    "person": "luxonis/scrfd-person-detection:25g-640x640",
     
-    # ============== SEGMENTATION MODELS ==============
-    "deeplabv3": {
-        "zoo_name": "deeplab_v3_plus_mvv2_decoder_256",
-        "shaves": 6,
-        "description": "DeepLabV3+ multi-class segmentation",
-    },
-    "deeplabv3-person": {
-        "zoo_name": "deeplabv3p_person",
-        "shaves": 6,
-        "description": "DeepLabV3+ person segmentation",
-    },
-    "selfie-segmentation": {
-        "zoo_name": "mediapipe_selfie",
-        "shaves": 6,
-        "description": "MediaPipe selfie/portrait segmentation",
-    },
+    # Pose Estimation
+    "pose_yolo": "luxonis/yolov8-nano-pose-estimation:coco-512x288",
+    "pose_hrnet": "luxonis/lite-hrnet:18-coco-288x384",
     
-    # ============== INSTANCE SEGMENTATION ==============
-    "yolov8n-seg": {
-        "zoo_name": "yolov8n-seg",
-        "shaves": 6,
-        "description": "YOLOv8 Nano instance segmentation",
-    },
+    # Hand Tracking
+    "hand": "luxonis/mediapipe-hand-landmarker:224x224",
     
-    # ============== POSE ESTIMATION MODELS ==============
-    "human-pose-estimation": {
-        "zoo_name": "human-pose-estimation-0001",
-        "shaves": 6,
-        "description": "Human pose estimation (18 keypoints)",
-    },
-    "openpose": {
-        "zoo_name": "openpose-pose",
-        "shaves": 6,
-        "description": "OpenPose body keypoint detection",
-    },
-    "yolov8n-pose": {
-        "zoo_name": "yolov8n-pose",
-        "shaves": 6,
-        "description": "YOLOv8 Nano pose estimation",
-    },
+    # Instance Segmentation
+    "segmentation": "luxonis/yolov8-instance-segmentation-nano:coco-512x288",
+    
+    # Gaze Estimation
+    "gaze": "luxonis/l2cs-net:448x448",
+    
+    # Line Detection
+    "lines": "luxonis/m-lsd:512x512",
 }
 
+# Default models to download (most commonly used)
+DEFAULT_MODELS = ["yolov8n", "face", "person", "pose_yolo", "hand", "segmentation"]
 
-def download_model(name: str, info: dict, output_dir: Path) -> bool:
-    """Download a single model and copy to output directory."""
-    zoo_name = info["zoo_name"]
-    shaves = info["shaves"]
-    output_path = output_dir / f"{name}.blob"
+
+def get_rvc2_platform() -> dai.Platform:
+    """Get RVC2 platform for OAK-D Lite."""
+    return dai.Platform.RVC2
+
+
+def download_model(model_key: str, model_slug: str, verbose: bool = True) -> bool:
+    """
+    Download a model from Luxonis Model Hub.
     
-    if output_path.exists():
-        print(f"  ✓ {name}: Already exists")
-        return True
+    The model will be cached locally by DepthAI for future offline use.
+    
+    Args:
+        model_key: Short name for the model
+        model_slug: Full Luxonis Model Hub slug
+        verbose: Print progress messages
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"Downloading: {model_key}")
+        print(f"Model Hub slug: {model_slug}")
+        print(f"{'='*60}")
     
     try:
-        print(f"  ↓ {name}: Downloading {zoo_name}...", end=" ", flush=True)
-        blob_path = blobconverter.from_zoo(name=zoo_name, shaves=shaves)
+        # Create model description - this triggers the download
+        model_desc = dai.NNModelDescription(model_slug)
         
-        # Copy to output directory with our naming convention
-        shutil.copy(blob_path, output_path)
-        print(f"OK ({output_path.stat().st_size // 1024} KB)")
+        # Get model path for RVC2 platform (this downloads if not cached)
+        model_path = dai.getModelFromZoo(model_desc, platform=get_rvc2_platform())
+        
+        if verbose:
+            print(f"✓ Downloaded successfully!")
+            print(f"  Cached at: {model_path}")
+        
         return True
         
     except Exception as e:
-        print(f"FAILED: {e}")
+        print(f"✗ Failed to download {model_key}: {e}")
         return False
 
 
+def list_available_models():
+    """Print all available models."""
+    print("\nAvailable models:")
+    print("-" * 60)
+    
+    # Group by category
+    categories = {
+        "Object Detection": ["yolov8n", "yolov6n", "yolov10n"],
+        "Face Detection": ["face"],
+        "Person Detection": ["person"],
+        "Pose Estimation": ["pose_yolo", "pose_hrnet"],
+        "Hand Tracking": ["hand"],
+        "Instance Segmentation": ["segmentation"],
+        "Gaze Estimation": ["gaze"],
+        "Line Detection": ["lines"],
+    }
+    
+    for category, keys in categories.items():
+        print(f"\n{category}:")
+        for key in keys:
+            slug = MODEL_SLUGS.get(key, "unknown")
+            default_marker = " (default)" if key in DEFAULT_MODELS else ""
+            print(f"  {key:20} -> {slug}{default_marker}")
+
+
+def check_depthai_version():
+    """Check that we have DepthAI v3+."""
+    version = getattr(dai, '__version__', '0.0.0')
+    major = int(version.split('.')[0])
+    
+    if major < 3:
+        print(f"WARNING: DepthAI version {version} detected.")
+        print("         This script requires DepthAI v3.0.0+")
+        print("         Install with: pip install depthai>=3.0.0")
+        return False
+    
+    print(f"DepthAI version: {version}")
+    return True
+
+
 def main():
-
-    # Simplest usage: sudo python3 scripts/download_oak_models.py
-    # Downloads all models to /opt/oak_models/ by default.
-
     parser = argparse.ArgumentParser(
-        description="Pre-download OAK-D Lite AI models for offline use"
+        description="Pre-download OAK-D models from Luxonis Model Hub",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --all                     Download all available models
+  %(prog)s --models yolov8n,face     Download specific models
+  %(prog)s --list                    List available models
+  %(prog)s                           Download default models
+        """
+    )
+    
+    parser.add_argument(
+        "--models", "-m",
+        type=str,
+        help="Comma-separated list of models to download"
     )
     parser.add_argument(
-        "--output", "-o",
-        type=Path,
-        default=Path("/opt/oak_models"),
-        help="Output directory for model files (default: /opt/oak_models)"
+        "--all", "-a",
+        action="store_true",
+        help="Download all available models"
     )
     parser.add_argument(
         "--list", "-l",
@@ -164,61 +171,70 @@ def main():
         help="List available models and exit"
     )
     parser.add_argument(
-        "--models", "-m",
-        nargs="+",
-        help="Download specific models only (space-separated names)"
+        "--quiet", "-q",
+        action="store_true",
+        help="Reduce output verbosity"
     )
+    
     args = parser.parse_args()
     
-    # List mode
+    # List models and exit
     if args.list:
-        print("Available models:\n")
-        for name, info in AVAILABLE_MODELS.items():
-            print(f"  {name:30} - {info['description']}")
-        print(f"\nTotal: {len(AVAILABLE_MODELS)} models")
+        list_available_models()
         return 0
     
-    # Determine which models to download
-    if args.models:
-        models_to_download = {
-            name: info for name, info in AVAILABLE_MODELS.items()
-            if name in args.models
-        }
-        unknown = set(args.models) - set(AVAILABLE_MODELS.keys())
-        if unknown:
-            print(f"Warning: Unknown models ignored: {unknown}")
-    else:
-        models_to_download = AVAILABLE_MODELS
+    # Version check
+    print("DepthAI v3 Model Downloader for OAK-D Lite")
+    print("=" * 50)
     
-    # Create output directory
-    output_dir = args.output
-    try:
-        output_dir.mkdir(parents=True, exist_ok=True)
-    except PermissionError:
-        print(f"Error: Cannot create {output_dir}. Try with sudo or use --output to specify a different directory.")
+    if not check_depthai_version():
         return 1
     
-    print(f"Downloading {len(models_to_download)} models to {output_dir}\n")
+    # Determine which models to download
+    if args.all:
+        models_to_download = list(MODEL_SLUGS.keys())
+        print(f"\nDownloading ALL {len(models_to_download)} models...")
+    elif args.models:
+        models_to_download = [m.strip() for m in args.models.split(",")]
+        # Validate
+        invalid = [m for m in models_to_download if m not in MODEL_SLUGS]
+        if invalid:
+            print(f"ERROR: Unknown models: {invalid}")
+            print("Use --list to see available models")
+            return 1
+        print(f"\nDownloading {len(models_to_download)} specified models...")
+    else:
+        models_to_download = DEFAULT_MODELS
+        print(f"\nDownloading {len(models_to_download)} default models...")
+        print("(Use --all for all models, or --models to specify)")
     
-    # Download models
-    success = 0
-    failed = 0
+    # Download each model
+    verbose = not args.quiet
+    success_count = 0
+    fail_count = 0
     
-    for name, info in models_to_download.items():
-        if download_model(name, info, output_dir):
-            success += 1
+    for model_key in models_to_download:
+        slug = MODEL_SLUGS[model_key]
+        if download_model(model_key, slug, verbose=verbose):
+            success_count += 1
         else:
-            failed += 1
+            fail_count += 1
     
     # Summary
-    print(f"\n{'='*50}")
-    print(f"Downloaded: {success}/{len(models_to_download)} models")
-    if failed:
-        print(f"Failed: {failed} models")
+    print("\n" + "=" * 50)
+    print("DOWNLOAD SUMMARY")
+    print("=" * 50)
+    print(f"  Successful: {success_count}")
+    print(f"  Failed:     {fail_count}")
+    print(f"  Total:      {len(models_to_download)}")
+    
+    if fail_count > 0:
+        print("\nSome downloads failed. Check network connection and try again.")
         return 1
     
-    print(f"\nModels saved to: {output_dir}")
-    print("These will be used automatically by the OakUnifiedNode.")
+    print("\n✓ All models downloaded successfully!")
+    print("  Models are cached and will work offline.")
+    
     return 0
 
 
