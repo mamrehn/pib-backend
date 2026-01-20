@@ -333,6 +333,9 @@ class OakUnifiedNode(Node):
         self.timer = self.create_timer(self.timer_period, self.timer_callback)
         self.status_timer = self.create_timer(1.0, self.status_timer_callback)
         
+        # Flag to force pipeline rebuild (e.g., after model change)
+        self._force_rebuild = False
+        
         self.get_logger().info("OakUnifiedNode initialized (MJPEG + AI + IMU). Waiting for subscribers...")
 
     def check_demand(self):
@@ -367,6 +370,11 @@ class OakUnifiedNode(Node):
             if not any(new_config.values()):
                 features_changed = True
 
+        # Also rebuild if forced (e.g., model change, config change)
+        if self._force_rebuild:
+            features_changed = True
+            self._force_rebuild = False
+        
         if features_changed:
             self.get_logger().info(f"Demand changed: {new_config}. Rebuilding pipeline...")
             self._rebuild_pipeline(new_config)
@@ -822,11 +830,18 @@ class OakUnifiedNode(Node):
             self.get_logger().info(f"Using local model: {local_path}")
             return local_path
         
-        # Fall back to blobconverter
+        # Fall back to blobconverter (this may block while downloading!)
         zoo_name = model_info.get('zoo_name', model_name)
         shaves = model_info.get('shaves', 6)
-        self.get_logger().info(f"Downloading model from zoo: {zoo_name}")
-        return Path(blobconverter.from_zoo(name=zoo_name, shaves=shaves))
+        self.get_logger().info(f"Downloading model from zoo: {zoo_name} (this may take a while...)")
+        try:
+            # blobconverter caches models, so subsequent loads are fast
+            blob_path = blobconverter.from_zoo(name=zoo_name, shaves=shaves)
+            self.get_logger().info(f"Model downloaded/cached: {blob_path}")
+            return Path(blob_path)
+        except Exception as e:
+            self.get_logger().error(f"Failed to get model {zoo_name}: {e}")
+            raise
     
     def _validate_imu_frequency(self, requested_freq: int) -> int:
         """Validate and round IMU frequency to BMI270 supported values"""
@@ -854,8 +869,8 @@ class OakUnifiedNode(Node):
         self.current_model_name = model_name
         
         # Trigger rebuild if AI is active
-        if self.current_pipeline_config['ai']:
-            self.current_pipeline_config['ai'] = False 
+        if self.current_pipeline_config.get('ai'):
+            self._force_rebuild = True
             self.check_demand()
              
         response.success = True
@@ -881,8 +896,8 @@ class OakUnifiedNode(Node):
                     self.imu_actual_freq = actual
                     self.get_logger().info(f"IMU frequency set to {actual}Hz")
                     
-                    if self.current_pipeline_config['imu']:
-                        self.current_pipeline_config['imu'] = False
+                    if self.current_pipeline_config.get('imu'):
+                        self._force_rebuild = True
                         self.check_demand()
         except Exception as e:
             self.get_logger().error(f"Invalid IMU config: {e}")
@@ -934,8 +949,8 @@ class OakUnifiedNode(Node):
                 else:
                     self.get_logger().error(f"Invalid segmentation_target_class: {target}. Use integer or null")
                 
-            if rebuild_needed and self.current_pipeline_config['ai']:
-                self.current_pipeline_config['ai'] = False 
+            if rebuild_needed and self.current_pipeline_config.get('ai'):
+                self._force_rebuild = True
                 self.check_demand()
                 
         except Exception as e:
