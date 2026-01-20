@@ -32,7 +32,7 @@ MODEL_SLUGS = {
     "yolov10n": "luxonis/yolov10-nano:coco-512x288",
     
     # Face Detection (YuNet is reliable and well-supported)
-    "face": "luxonis/yunet:320x320",
+    "face": "luxonis/yunet:640x480",
     
     # Person Detection
     "person": "luxonis/scrfd-person-detection:25g-640x640",
