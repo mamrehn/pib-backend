@@ -59,11 +59,6 @@ MODEL_SLUGS = {
 DEFAULT_MODELS = ["yolov8n", "face", "person", "pose_yolo", "hand", "segmentation"]
 
 
-def get_rvc2_platform() -> dai.Platform:
-    """Get RVC2 platform for OAK-D Lite."""
-    return dai.Platform.RVC2
-
-
 def download_model(model_key: str, model_slug: str, verbose: bool = True) -> bool:
     """
     Download a model from Luxonis Model Hub.
@@ -85,11 +80,13 @@ def download_model(model_key: str, model_slug: str, verbose: bool = True) -> boo
         print(f"{'='*60}")
     
     try:
-        # Create model description - this triggers the download
+        # Create model description with platform set for RVC2 (OAK-D Lite)
         model_desc = dai.NNModelDescription(model_slug)
+        model_desc.platform = dai.Platform.RVC2
         
-        # Get model path for RVC2 platform (this downloads if not cached)
-        model_path = dai.getModelFromZoo(model_desc, platform=get_rvc2_platform())
+        # Get model path (this downloads if not cached)
+        # progressFormat can be: 'none', 'bar', 'percent'
+        model_path = dai.getModelFromZoo(model_desc, progressFormat='bar' if verbose else 'none')
         
         if verbose:
             print(f"✓ Downloaded successfully!")
