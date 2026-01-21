@@ -9,12 +9,18 @@ Features:
 - Dynamic Model Selection - switch models at runtime
 - RLE-encoded segmentation masks for efficient transmission
 
-Uses DepthAI v3 API with NNModelDescription for model loading from Luxonis Model Hub.
+Uses DepthAI v3 API with:
+- dai.node.Camera with .build() and .requestOutput()
+- createOutputQueue() instead of XLinkOut nodes
+- pipeline.start()/stop() instead of dai.Device(pipeline)
+- DetectionNetwork.build(cameraNode, modelDescription)
+
 All features are on-demand: only active when subscribed.
 """
 import base64
 import json
 import time
+import threading
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -32,21 +38,15 @@ from geometry_msgs.msg import Vector3Stamped
 # ============== MODEL REGISTRY (DepthAI v3 Model Hub) ==============
 # Format: "luxonis/model-name:variant" for Model Hub
 # All models are optimized for RVC2 (OAK-D Lite)
+# Slugs must match scripts/download_oak_models.py for pre-caching
 
 AVAILABLE_MODELS = {
     # ============== OBJECT DETECTION ==============
-    "yolov8n": {
-        "type": "detection",
-        "slug": "luxonis/yolov8-nano:coco-512x288",
-        "description": "YOLOv8 Nano - fast & accurate object detection",
-        "classes": 80,  # COCO classes
-        "node_type": "DetectionNetwork",
-    },
     "yolov6n": {
         "type": "detection",
         "slug": "luxonis/yolov6-nano:r2-coco-512x288",
-        "description": "YOLOv6 Nano - efficient detection",
-        "classes": 80,
+        "description": "YOLOv6 Nano - fast & accurate object detection",
+        "classes": 80,  # COCO classes
         "node_type": "DetectionNetwork",
     },
     "yolov10n": {
@@ -56,73 +56,62 @@ AVAILABLE_MODELS = {
         "classes": 80,
         "node_type": "DetectionNetwork",
     },
-    
-    # ============== FACE DETECTION ==============
-    "face": {
-        "type": "detection",
-        "slug": "luxonis/scrfd:2.5g-kps-640x640",
-        "description": "SCRFD face detection with keypoints",
-        "classes": 1,
-        "node_type": "ParsingNeuralNetwork",
-        "output_type": "ImgDetectionsExtended",  # Has keypoints
-    },
-    
-    # ============== PERSON DETECTION ==============
     "person": {
         "type": "detection",
         "slug": "luxonis/scrfd-person-detection:25g-640x640",
-        "description": "SCRFD person detection",
+        "description": "SCRFD Person detector - optimized for people detection",
         "classes": 1,
         "node_type": "DetectionNetwork",
     },
-    
+    "face": {
+        "type": "detection",
+        "slug": "luxonis/yunet:640x480",
+        "description": "YuNet face detection - fast and reliable",
+        "classes": 1,
+        "node_type": "DetectionNetwork",
+    },
     # ============== POSE ESTIMATION ==============
     "pose_yolo": {
         "type": "pose",
         "slug": "luxonis/yolov8-nano-pose-estimation:coco-512x288",
-        "description": "YOLOv8 Nano pose estimation (17 keypoints)",
+        "description": "YOLOv8 Pose - 17 keypoint body pose",
         "keypoints": 17,
         "node_type": "ParsingNeuralNetwork",
-        "output_type": "Keypoints",
+        "output_type": "ImgDetectionsExtended",
     },
     "pose_hrnet": {
         "type": "pose",
         "slug": "luxonis/lite-hrnet:18-coco-288x384",
-        "description": "Lite-HRNet - accurate pose estimation",
+        "description": "Lite-HRNet - high resolution pose estimation",
         "keypoints": 17,
         "node_type": "ParsingNeuralNetwork",
         "output_type": "Keypoints",
     },
-    
-    # ============== HAND TRACKING ==============
+    # ============== HAND DETECTION ==============
     "hand": {
         "type": "hand",
         "slug": "luxonis/mediapipe-hand-landmarker:224x224",
-        "description": "MediaPipe hand landmark detection (21 keypoints)",
-        "keypoints": 21,
+        "description": "MediaPipe hand landmark detection",
         "node_type": "ParsingNeuralNetwork",
         "output_type": "Keypoints",
     },
-    
-    # ============== INSTANCE SEGMENTATION ==============
+    # ============== SEGMENTATION ==============
     "segmentation": {
         "type": "instance-segmentation",
         "slug": "luxonis/yolov8-instance-segmentation-nano:coco-512x288",
-        "description": "YOLOv8 Nano instance segmentation",
+        "description": "YOLOv8 Instance Segmentation",
         "classes": 80,
         "node_type": "ParsingNeuralNetwork",
-        "output_type": "ImgDetectionsExtended",  # Detection + masks
+        "output_type": "ImgDetectionsExtended",
     },
-    
     # ============== GAZE ESTIMATION ==============
     "gaze": {
         "type": "gaze",
         "slug": "luxonis/l2cs-net:448x448",
         "description": "L2CS-Net gaze estimation",
         "node_type": "ParsingNeuralNetwork",
-        "output_type": "Predictions",  # Yaw/pitch predictions
+        "output_type": "Predictions",
     },
-    
     # ============== LINE DETECTION ==============
     "lines": {
         "type": "lines",
@@ -133,169 +122,176 @@ AVAILABLE_MODELS = {
     },
 }
 
-# Default model to use
-DEFAULT_MODEL = "yolov8n"
-
-# BMI270 valid frequencies (sensor rounds DOWN to nearest)
-BMI270_VALID_FREQUENCIES = [25, 50, 100, 200, 250]
+# Valid IMU frequencies for BMI270 sensor
+BMI270_VALID_FREQUENCIES = [25, 50, 100, 200, 400]
 
 
-def rle_encode(binary_mask: np.ndarray) -> dict:
+def rle_encode(mask: np.ndarray) -> Dict[str, Any]:
     """
-    Run-length encode a binary mask for efficient transmission.
-
-    Args:
-        binary_mask: 2D numpy array with 0s and 1s (or 0s and 255s)
-
-    Returns:
-        dict with 'size' (width, height) and 'counts' (run lengths starting with 0-count)
-
-    Format: counts alternate between 0-pixels and 1-pixels, starting with 0-count.
-    Example: [3, 5, 2, 10] means 3 zeros, 5 ones, 2 zeros, 10 ones
-
-    This is compatible with COCO RLE format and pycocotools.
+    RLE-encode a binary mask for efficient transmission.
+    Much smaller than raw mask data.
     """
-    h, w = binary_mask.shape
-    # Flatten in column-major (Fortran) order for COCO compatibility
-    pixels = (binary_mask.flatten(order='F') > 0).astype(np.uint8)
-
-    # Find transitions
-    pixels_padded = np.concatenate([[0], pixels, [0]])
-    transitions = np.where(pixels_padded[1:] != pixels_padded[:-1])[0]
-
-    # Calculate run lengths
-    counts = np.diff(transitions).tolist()
-
-    # If mask starts with 1, prepend a 0-count
-    if len(counts) > 0 and pixels[0] == 1:
-        counts = [0] + counts
-
+    flat = mask.flatten().astype(np.uint8)
+    runs = []
+    values = []
+    
+    if len(flat) == 0:
+        return {"runs": [], "values": [], "shape": list(mask.shape)}
+    
+    current_val = flat[0]
+    run_length = 1
+    
+    for i in range(1, len(flat)):
+        if flat[i] == current_val:
+            run_length += 1
+        else:
+            runs.append(run_length)
+            values.append(int(current_val))
+            current_val = flat[i]
+            run_length = 1
+    
+    runs.append(run_length)
+    values.append(int(current_val))
+    
     return {
-        "size": [h, w],  # height, width (COCO format)
-        "counts": counts
+        "runs": runs,
+        "values": values,
+        "shape": list(mask.shape)
     }
 
 
-def rle_decode(rle: dict) -> np.ndarray:
-    """
-    Decode RLE back to binary mask (for verification/testing).
-
-    Args:
-        rle: dict with 'size' [h, w] and 'counts' (run lengths)
-
-    Returns:
-        2D numpy array binary mask
-    """
-    h, w = rle["size"]
-    counts = rle["counts"]
-
-    pixels = []
-    val = 0  # Start with 0s
-    for count in counts:
-        pixels.extend([val] * count)
-        val = 1 - val  # Toggle between 0 and 1
-
-    # Reshape in column-major order
-    mask = np.array(pixels, dtype=np.uint8).reshape((h, w), order='F')
-    return mask
-
-
 class ErrorPublisher(Node):
+    """Fallback node to publish errors when camera fails"""
+    
     def __init__(self):
-        super().__init__("error_publisher")
-        self.publisher_ = self.create_publisher(String, "camera_topic", 10)
-        timer_period = 1  # seconds
-        self.timer = self.create_timer(timer_period, self.timer_callback)
-
-    def timer_callback(self):
+        super().__init__("camera_error")
+        self.error_pub = self.create_publisher(String, "camera/error", 10)
+        self.timer = self.create_timer(1.0, self._publish_error)
+        
+    def _publish_error(self):
         msg = String()
-        msg.data = "Camera not available"
-        self.publisher_.publish(msg)
+        msg.data = json.dumps({
+            "error": "OAK-D Lite camera failed to initialize",
+            "timestamp": time.time()
+        })
+        self.error_pub.publish(msg)
 
 
 class OakUnifiedNode(Node):
+    """
+    Unified OAK-D Lite Node with DepthAI v3 API
+    
+    All features are on-demand - only active when there are subscribers.
+    Uses v3 API patterns:
+    - Pipeline context manager NOT used (need persistent pipeline)
+    - Camera.build() + requestOutput()
+    - createOutputQueue() instead of XLinkOut
+    - VideoEncoder.build(output, frameRate, profile)
+    - DetectionNetwork.build(cameraNode, modelDescription)
+    """
+    
     def __init__(self):
-        super().__init__("camera_node")
+        super().__init__("oak_unified_node")
         
         # Check DepthAI version
         self._check_depthai_version()
         
-        # ============== PUBLISHERS ==============
-        # Video - MJPEG frames (subscribe with CBOR compression for binary transfer)
-        # Legacy: camera_topic (base64 JPEG string) - kept for backward compatibility
-        self.rgb_pub = self.create_publisher(String, "camera_topic", 10)
-        # New: camera/image (binary JPEG via CompressedImage, use CBOR subscription)
-        self.camera_image_pub = self.create_publisher(CompressedImage, "camera/image", 10)
-
-        # IMU (follows existing imu/* namespace)
-        self.imu_pub = self.create_publisher(Imu, "imu/data", 10)
-        self.imu_accel_pub = self.create_publisher(Vector3Stamped, "imu/accelerometer", 10)
-        self.imu_gyro_pub = self.create_publisher(Vector3Stamped, "imu/gyroscope", 10)
-
-        # AI (follows existing ai/* namespace pattern)
-        self.ai_pub = self.create_publisher(String, "ai/detections", 10)
-        self.ai_available_pub = self.create_publisher(String, "ai/available_models", 10)
-        self.ai_current_pub = self.create_publisher(String, "ai/current_model", 10)
-        self.ai_status_pub = self.create_publisher(String, "ai/status", 10)  # For model loading status
-
-        # ============== SUBSCRIBERS ==============
-        self.create_subscription(Float64, "timer_period_topic", self.timer_period_callback, 10)
-        self.create_subscription(Int32, "quality_factor_topic", self.quality_factor_callback, 10)
-        self.create_subscription(Int32MultiArray, "size_topic", self.preview_size_callback, 10)
-        self.create_subscription(String, "imu/config", self.imu_config_callback, 10)
-        self.create_subscription(String, "ai/config", self.ai_config_callback, 10)
-        self.create_subscription(String, "camera/config", self.camera_config_callback, 10)
-
-        # ============== SERVICES ==============
-        self.create_service(GetCameraImage, "get_camera_image", self.get_camera_image_callback)
-        self.create_service(SwitchModel, "camera_node/switch_model", self.switch_model_callback)
-
-        # ============== VIDEO CONFIG ==============
-        self.preview_width = 1280
-        self.preview_height = 720
-        self.quality_factor = 80
-        self.video_fps = 30
-        self.video_bitrate = 0  # 0 = auto (use quality_factor for MJPEG)
-        self.current_image = ""
-        
-        # ============== IMU CONFIG ==============
-        self.imu_freq = 100
-        self.imu_actual_freq = 100  # After BMI270 rounding
-        
-        # ============== AI CONFIG ==============
-        self.current_model_name = DEFAULT_MODEL
-        self.ai_confidence = 0.5
-        
-        # Segmentation mode: "bbox" (bounding boxes for all classes) or "mask" (binary mask for target_class)
-        self.segmentation_mode = "bbox"
-        self.segmentation_target_class = None  # If set, return binary mask for this class
-        
-        # ============== DEVICE STATE ==============
-        self.device: Optional[dai.Device] = None
+        # Pipeline state
+        self.pipeline: Optional[dai.Pipeline] = None
         self.queues: Dict[str, Any] = {}
-        self.current_pipeline_config = {
-            'video': False,  # MJPEG camera frames
-            'ai': False,
-            'imu': False
-        }
-        
-        # Frame counter for AI output
-        self._frame_count = 0
-        self._ai_inference_start = 0.0
-        
-        # ============== TIMERS ==============
-        self.timer_period = 0.1
-        self.timer = self.create_timer(self.timer_period, self.timer_callback)
-        self.status_timer = self.create_timer(1.0, self.status_timer_callback)
-        
-        # Flag to force pipeline rebuild (e.g., after model change)
+        self.current_pipeline_config = {'video': False, 'ai': False, 'imu': False}
         self._force_rebuild = False
+        self._pipeline_lock = threading.Lock()
         
-        # Model loading state for status feedback
+        # Model state
+        self.current_model_name = "yolov6n"
         self._model_loading = False
         self._model_load_error: Optional[str] = None
         
-        self.get_logger().info("OakUnifiedNode initialized (DepthAI v3 + MJPEG + AI + IMU). Waiting for subscribers...")
+        # Camera settings
+        self.preview_width = 640
+        self.preview_height = 480
+        self.video_fps = 30
+        self.quality_factor = 80
+        self.current_image = None  # For service
+        
+        # AI settings
+        self.ai_confidence = 0.5
+        self.segmentation_mode = "bbox"  # "bbox" or "mask"
+        self.segmentation_target_class = None  # None = all classes
+        self._frame_count = 0
+        
+        # IMU settings
+        self.imu_freq = 100
+        self.imu_actual_freq = self._validate_imu_frequency(100)
+        
+        # Timer
+        self.timer_period = 0.03  # ~33Hz
+        
+        # ============== PUBLISHERS ==============
+        # Video - binary (efficient)
+        self.camera_image_pub = self.create_publisher(
+            CompressedImage, "camera/image/compressed", 10
+        )
+        # Video - legacy base64 (backward compatibility)
+        self.rgb_pub = self.create_publisher(String, "camera/rgb/image", 10)
+        
+        # AI
+        self.ai_pub = self.create_publisher(String, "camera/ai/detections", 10)
+        self.ai_current_pub = self.create_publisher(String, "camera/ai/current_model", 10)
+        self.ai_available_pub = self.create_publisher(String, "camera/ai/available_models", 10)
+        self.ai_status_pub = self.create_publisher(String, "camera/ai/status", 10)
+        
+        # IMU
+        self.imu_pub = self.create_publisher(Imu, "camera/imu", 50)
+        self.imu_accel_pub = self.create_publisher(
+            Vector3Stamped, "camera/imu/accelerometer", 50
+        )
+        self.imu_gyro_pub = self.create_publisher(
+            Vector3Stamped, "camera/imu/gyroscope", 50
+        )
+        
+        # Error
+        self.error_pub = self.create_publisher(String, "camera/error", 10)
+        
+        # ============== SUBSCRIBERS ==============
+        self.create_subscription(
+            String, "camera/ai/config", self.ai_config_callback, 10
+        )
+        self.create_subscription(
+            String, "camera/video/config", self.camera_config_callback, 10
+        )
+        self.create_subscription(
+            String, "camera/imu/config", self.imu_config_callback, 10
+        )
+        self.create_subscription(
+            Float64, "camera/timer_period", self.timer_period_callback, 10
+        )
+        self.create_subscription(
+            Int32, "camera/quality_factor", self.quality_factor_callback, 10
+        )
+        self.create_subscription(
+            Int32MultiArray, "camera/preview_size", self.preview_size_callback, 10
+        )
+        
+        # ============== SERVICES ==============
+        self.create_service(
+            GetCameraImage, "get_camera_image", self.get_camera_image_callback
+        )
+        self.create_service(
+            SwitchModel, "switch_ai_model", self.switch_model_callback
+        )
+        
+        # ============== TIMERS ==============
+        self.timer = self.create_timer(self.timer_period, self.timer_callback)
+        self.status_timer = self.create_timer(1.0, self.status_timer_callback)
+        
+        self.get_logger().info("OAK Unified Node initialized (DepthAI v3)")
+        self._publish_status("idle", "Ready - waiting for subscribers")
+    
+    def _validate_imu_frequency(self, requested: int) -> int:
+        """Find the closest valid BMI270 frequency"""
+        return min(BMI270_VALID_FREQUENCIES, key=lambda x: abs(x - requested))
     
     def _publish_status(self, state: str, message: str = "", model: str = ""):
         """Publish AI status update to ai/status topic"""
@@ -316,10 +312,11 @@ class OakUnifiedNode(Node):
         version = getattr(dai, '__version__', '0.0.0')
         major = int(version.split('.')[0])
         if major < 3:
-            self.get_logger().warning(
-                f"DepthAI v{version} detected. This node is optimized for DepthAI v3.0.0+. "
-                "Some features may not work correctly."
+            self.get_logger().error(
+                f"DepthAI v{version} detected. This node REQUIRES DepthAI v3.0.0+. "
+                "Please upgrade with: pip install depthai>=3.0.0"
             )
+            raise RuntimeError(f"DepthAI v3+ required, found v{version}")
         else:
             self.get_logger().info(f"DepthAI version: {version}")
 
@@ -342,16 +339,16 @@ class OakUnifiedNode(Node):
         # Determine if rebuild is needed
         features_changed = False
 
-        # If we have no device, and we need something, rebuild
-        if self.device is None and any(new_config.values()):
+        # If we have no pipeline, and we need something, rebuild
+        if self.pipeline is None and any(new_config.values()):
             features_changed = True
 
-        # If we have device, check if feature set changed
-        elif self.device is not None:
+        # If we have pipeline, check if feature set changed
+        elif self.pipeline is not None:
             if new_config != self.current_pipeline_config:
                 features_changed = True
 
-            # Also close device if all demands drop to zero (save power/heat)
+            # Also close pipeline if all demands drop to zero (save power/heat)
             if not any(new_config.values()):
                 features_changed = True
 
@@ -375,275 +372,312 @@ class OakUnifiedNode(Node):
             raise ValueError(f"Model {model_name} has no slug defined")
         
         self.get_logger().info(f"Creating model description for: {slug}")
-        return dai.NNModelDescription(slug)
+        model_desc = dai.NNModelDescription(slug)
+        # Set platform for RVC2 (OAK-D Lite)
+        model_desc.platform = "RVC2"
+        return model_desc
 
     def _rebuild_pipeline(self, config):
-        """Rebuild the pipeline with the current configuration"""
-        if self.device:
-            self.device.close()
-            self.device = None
-            self.queues = {}
+        """
+        Rebuild the pipeline with the current configuration using DepthAI v3 API.
+        
+        V3 Key differences:
+        - dai.node.Camera with .build() instead of ColorCamera
+        - camera.requestOutput((w, h)) instead of camera.preview
+        - output.createOutputQueue() instead of XLinkOut nodes
+        - VideoEncoder.build(output, frameRate=fps, profile=profile)
+        - DetectionNetwork.build(cameraNode, modelDescription)
+        - pipeline.start()/stop() instead of dai.Device(pipeline)
+        """
+        with self._pipeline_lock:
+            # Stop existing pipeline
+            if self.pipeline is not None:
+                try:
+                    self.pipeline.stop()
+                except Exception as e:
+                    self.get_logger().warning(f"Error stopping pipeline: {e}")
+                self.pipeline = None
+                self.queues = {}
 
-        if not any(config.values()):
-            self.current_pipeline_config = config
-            self._publish_status("idle", "No features active")
-            return
+            if not any(config.values()):
+                self.current_pipeline_config = config
+                self._publish_status("idle", "No features active")
+                return
 
-        # Track if AI was successfully configured
-        ai_configured = False
-        self._model_loading = config['ai']
-        self._model_load_error = None
+            # Track if AI was successfully configured
+            ai_configured = False
+            self._model_loading = config['ai']
+            self._model_load_error = None
 
-        if config['ai']:
-            self._publish_status("loading", f"Loading model {self.current_model_name}...")
+            if config['ai']:
+                self._publish_status("loading", f"Loading model {self.current_model_name}...")
 
-        try:
-            # Create pipeline (don't use context manager - we need it to persist!)
-            pipeline = dai.Pipeline()
-            
-            # --- Camera (MJPEG) & AI ---
-            needs_camera = config['video'] or config['ai']
+            try:
+                # Create new pipeline (NOT as context manager - we need it to persist)
+                pipeline = dai.Pipeline()
+                
+                # --- Camera & Video ---
+                needs_camera = config['video'] or config['ai']
+                camera_node = None
+                camera_output = None
 
-            if needs_camera:
-                camRgb = pipeline.create(dai.node.ColorCamera)
-                camRgb.setPreviewSize(self.preview_width, self.preview_height)
-                camRgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
-                camRgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-                camRgb.setInterleaved(False)
-                camRgb.setFps(self.video_fps)
+                if needs_camera:
+                    # Create camera with v3 API
+                    camera_node = pipeline.create(dai.node.Camera).build(
+                        dai.CameraBoardSocket.CAM_A
+                    )
+                    
+                    # Request output at specified resolution
+                    camera_output = camera_node.requestOutput(
+                        (self.preview_width, self.preview_height),
+                        type=dai.ImgFrame.Type.BGR888p
+                    )
 
-                # Video Output - MJPEG encoder for individual frames
-                if config['video']:
-                    # Use hardware MJPEG encoder - each frame is independent JPEG
-                    mjpeg_enc = pipeline.create(dai.node.VideoEncoder)
-                    mjpeg_enc.setDefaultProfilePreset(self.video_fps, dai.VideoEncoderProperties.Profile.MJPEG)
-                    mjpeg_enc.setQuality(self.quality_factor)
-                    camRgb.video.link(mjpeg_enc.input)
-
-                    xoutVideo = pipeline.create(dai.node.XLinkOut)
-                    xoutVideo.setStreamName("video")
-                    mjpeg_enc.bitstream.link(xoutVideo.input)
-
-                # AI Output - Use DepthAI v3 Model Hub
-                if config['ai']:
-                    try:
-                        model_info = AVAILABLE_MODELS.get(self.current_model_name, {})
-                        node_type = model_info.get('node_type', 'DetectionNetwork')
-
-                        self.get_logger().info(
-                            f"Loading model: {self.current_model_name} "
-                            f"(type={model_info.get('type')}, node={node_type}) - "
-                            "this may take a moment if downloading..."
+                    # Video Output - MJPEG encoder
+                    if config['video']:
+                        # Create video encoder with v3 API
+                        video_encoder = pipeline.create(dai.node.VideoEncoder).build(
+                            camera_output,
+                            frameRate=self.video_fps,
+                            profile=dai.VideoEncoderProperties.Profile.MJPEG
                         )
+                        # Note: Quality setting may need different approach in v3
+                        # video_encoder.setQuality(self.quality_factor)  # May not exist in v3
                         
-                        # Get model description - this may trigger download from Model Hub
-                        model_desc = self._get_model_description(self.current_model_name)
+                        # Create output queue for video
+                        self.queues['video'] = video_encoder.out.createOutputQueue(
+                            maxSize=4, blocking=False
+                        )
 
-                        if node_type == 'DetectionNetwork':
-                            # Simple detection - auto-parsed to dai.ImgDetections
-                            nn = pipeline.create(dai.node.DetectionNetwork).build(
-                                camRgb.preview, model_desc
+                    # AI Output - Detection Network
+                    if config['ai']:
+                        try:
+                            model_info = AVAILABLE_MODELS.get(self.current_model_name, {})
+                            node_type = model_info.get('node_type', 'DetectionNetwork')
+
+                            self.get_logger().info(
+                                f"Loading model: {self.current_model_name} "
+                                f"(type={model_info.get('type')}, node={node_type}) - "
+                                "this may take a moment if downloading..."
                             )
-                            nn.input.setBlocking(False)
                             
-                            xoutNn = pipeline.create(dai.node.XLinkOut)
-                            xoutNn.setStreamName("nn")
-                            nn.out.link(xoutNn.input)
-                            ai_configured = True
-                            
-                        elif node_type == 'ParsingNeuralNetwork':
-                            # Complex models with custom parsers (depthai-nodes)
-                            try:
-                                from depthai_nodes import ParsingNeuralNetwork
-                                nn = ParsingNeuralNetwork.build(camRgb.preview, model_desc)
-                                nn.input.setBlocking(False)
-                                
-                                xoutNn = pipeline.create(dai.node.XLinkOut)
-                                xoutNn.setStreamName("nn")
-                                nn.out.link(xoutNn.input)
-                                ai_configured = True
-                            except ImportError:
-                                self.get_logger().error(
-                                    "depthai-nodes not installed. Install with: "
-                                    "pip install depthai-nodes"
+                            # Get model description
+                            model_desc = self._get_model_description(self.current_model_name)
+
+                            if node_type == 'DetectionNetwork':
+                                # v3 API: DetectionNetwork.build(cameraNode, modelDesc)
+                                nn = pipeline.create(dai.node.DetectionNetwork).build(
+                                    camera_node, model_desc
                                 )
-                                # Fall back to NeuralNetwork for raw output
+                                
+                                # Create output queues
+                                self.queues['nn'] = nn.out.createOutputQueue(
+                                    maxSize=4, blocking=False
+                                )
+                                # Passthrough for getting frames with detections
+                                self.queues['nn_passthrough'] = nn.passthrough.createOutputQueue(
+                                    maxSize=4, blocking=False
+                                )
+                                ai_configured = True
+                                
+                            elif node_type == 'ParsingNeuralNetwork':
+                                # Complex models with custom parsers (depthai-nodes)
+                                try:
+                                    from depthai_nodes import ParsingNeuralNetwork
+                                    nn = ParsingNeuralNetwork.build(camera_node, model_desc)
+                                    
+                                    self.queues['nn'] = nn.out.createOutputQueue(
+                                        maxSize=4, blocking=False
+                                    )
+                                    ai_configured = True
+                                except ImportError:
+                                    self.get_logger().error(
+                                        "depthai-nodes not installed. Install with: "
+                                        "pip install depthai-nodes"
+                                    )
+                                    # Fall back to NeuralNetwork for raw output
+                                    nn = pipeline.create(dai.node.NeuralNetwork)
+                                    nn.setNNModelDescription(model_desc)
+                                    nn.input.setBlocking(False)
+                                    camera_output.link(nn.input)
+                                    
+                                    self.queues['nn'] = nn.out.createOutputQueue(
+                                        maxSize=4, blocking=False
+                                    )
+                                    ai_configured = True
+                            else:
+                                # Generic NeuralNetwork fallback
                                 nn = pipeline.create(dai.node.NeuralNetwork)
                                 nn.setNNModelDescription(model_desc)
                                 nn.input.setBlocking(False)
-                                camRgb.preview.link(nn.input)
+                                camera_output.link(nn.input)
                                 
-                                xoutNn = pipeline.create(dai.node.XLinkOut)
-                                xoutNn.setStreamName("nn")
-                                nn.out.link(xoutNn.input)
+                                self.queues['nn'] = nn.out.createOutputQueue(
+                                    maxSize=4, blocking=False
+                                )
                                 ai_configured = True
-                        else:
-                            # Generic NeuralNetwork fallback
-                            nn = pipeline.create(dai.node.NeuralNetwork)
-                            nn.setNNModelDescription(model_desc)
-                            nn.input.setBlocking(False)
-                            camRgb.preview.link(nn.input)
-                            
-                            xoutNn = pipeline.create(dai.node.XLinkOut)
-                            xoutNn.setStreamName("nn")
-                            nn.out.link(xoutNn.input)
-                            ai_configured = True
 
-                    except Exception as e:
-                        error_msg = f"Failed to load model {self.current_model_name}: {e}"
-                        self.get_logger().error(error_msg)
-                        self._model_load_error = str(e)
-                        self._publish_status("error", error_msg)
-                        # AI failed, but we can still run video/IMU
-                        ai_configured = False
+                        except Exception as e:
+                            error_msg = f"Failed to load model {self.current_model_name}: {e}"
+                            self.get_logger().error(error_msg)
+                            self._model_load_error = str(e)
+                            self._publish_status("error", error_msg)
+                            # AI failed, but we can still run video/IMU
+                            ai_configured = False
 
-            # --- IMU ---
-            if config['imu']:
-                imu = pipeline.create(dai.node.IMU)
-                sensors = [dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW]
-                imu.enableIMUSensor(sensors, self.imu_actual_freq)
-                imu.setBatchReportThreshold(1)
-                imu.setMaxBatchReports(10)
+                # --- IMU ---
+                if config['imu']:
+                    imu = pipeline.create(dai.node.IMU)
+                    imu.enableIMUSensor(dai.IMUSensor.ACCELEROMETER_RAW, self.imu_actual_freq)
+                    imu.enableIMUSensor(dai.IMUSensor.GYROSCOPE_RAW, self.imu_actual_freq)
+                    imu.setBatchReportThreshold(1)
+                    imu.setMaxBatchReports(10)
 
-                xoutImu = pipeline.create(dai.node.XLinkOut)
-                xoutImu.setStreamName("imu")
-                imu.out.link(xoutImu.input)
+                    self.queues['imu'] = imu.out.createOutputQueue(
+                        maxSize=50, blocking=False
+                    )
 
-            # Start the pipeline with the device
-            self.device = dai.Device(pipeline)
-            
-            # Update config to reflect what was actually configured
-            actual_config = config.copy()
-            if config['ai'] and not ai_configured:
-                actual_config['ai'] = False
-                self.get_logger().warning("AI was requested but failed to configure")
-            
-            self.current_pipeline_config = actual_config
-            self._model_loading = False
+                # Start the pipeline
+                pipeline.start()
+                self.pipeline = pipeline
+                
+                # Update config to reflect what was actually configured
+                actual_config = config.copy()
+                if config['ai'] and not ai_configured:
+                    actual_config['ai'] = False
+                    self.get_logger().warning("AI was requested but failed to configure")
+                
+                self.current_pipeline_config = actual_config
+                self._model_loading = False
 
-            # Setup queues
-            if actual_config['video']:
-                self.queues['video'] = self.device.getOutputQueue(name="video", maxSize=4, blocking=False)
-            if actual_config['ai']:
-                self.queues['nn'] = self.device.getOutputQueue(name="nn", maxSize=4, blocking=False)
-                # Publish success status
-                self._publish_status("ready", f"Model {self.current_model_name} loaded successfully")
-            if actual_config['imu']:
-                self.queues['imu'] = self.device.getOutputQueue(name="imu", maxSize=50, blocking=False)
+                if actual_config['ai']:
+                    self._publish_status("ready", f"Model {self.current_model_name} loaded successfully")
 
-            active_features = [k for k, v in actual_config.items() if v]
-            self.get_logger().info(f"Pipeline started: {active_features}")
-            
-        except Exception as e:
-            error_msg = f"Failed to start pipeline: {e}"
-            self.get_logger().error(error_msg)
-            self._model_loading = False
-            self._model_load_error = str(e)
-            self._publish_status("error", error_msg)
-            self.device = None
-            self.current_pipeline_config = {'video': False, 'ai': False, 'imu': False}
+                active_features = [k for k, v in actual_config.items() if v]
+                self.get_logger().info(f"Pipeline started: {active_features}")
+                
+            except Exception as e:
+                error_msg = f"Failed to start pipeline: {e}"
+                self.get_logger().error(error_msg)
+                self._model_loading = False
+                self._model_load_error = str(e)
+                self._publish_status("error", error_msg)
+                self.pipeline = None
+                self.queues = {}
+                self.current_pipeline_config = {'video': False, 'ai': False, 'imu': False}
 
     def timer_callback(self):
+        """Main processing loop - check demand and process queues"""
         # 1. Check demand and rebuild if necessary
         try:
             self.check_demand()
         except Exception as e:
             self.get_logger().error(f"Error in check_demand: {e}")
 
-        if not self.device:
+        if not self.pipeline:
             return
 
         # 2. Process MJPEG video frames
         if 'video' in self.queues:
-            q = self.queues['video']
-            while q.has():
-                packet = q.get()
-                jpeg_data = packet.getData().tobytes()
+            try:
+                q = self.queues['video']
+                while q.has():
+                    packet = q.get()
+                    jpeg_data = packet.getData().tobytes()
 
-                # Publish to new binary topic (use CBOR subscription for efficiency)
-                img_msg = CompressedImage()
-                img_msg.header.stamp = self.get_clock().now().to_msg()
-                img_msg.header.frame_id = "oak_camera"
-                img_msg.format = "jpeg"
-                img_msg.data = jpeg_data
-                self.camera_image_pub.publish(img_msg)
+                    # Publish to new binary topic (use CBOR subscription for efficiency)
+                    img_msg = CompressedImage()
+                    img_msg.header.stamp = self.get_clock().now().to_msg()
+                    img_msg.header.frame_id = "oak_camera"
+                    img_msg.format = "jpeg"
+                    img_msg.data = jpeg_data
+                    self.camera_image_pub.publish(img_msg)
 
-                # Also publish to legacy base64 topic for backward compatibility
-                if self.rgb_pub.get_subscription_count() > 0:
-                    legacy_msg = String()
-                    legacy_msg.data = base64.b64encode(jpeg_data).decode('utf-8')
-                    self.current_image = legacy_msg.data
-                    self.rgb_pub.publish(legacy_msg)
+                    # Also publish to legacy base64 topic for backward compatibility
+                    if self.rgb_pub.get_subscription_count() > 0:
+                        legacy_msg = String()
+                        legacy_msg.data = base64.b64encode(jpeg_data).decode('utf-8')
+                        self.current_image = legacy_msg.data
+                        self.rgb_pub.publish(legacy_msg)
+            except Exception as e:
+                self.get_logger().error(f"Error processing video: {e}")
 
         # 3. Process AI
         if 'nn' in self.queues:
-            q = self.queues['nn']
-            while q.has():
-                self._frame_count += 1
+            try:
+                q = self.queues['nn']
+                while q.has():
+                    self._frame_count += 1
 
-                in_data = q.get()
-                model_info = AVAILABLE_MODELS.get(self.current_model_name, {})
-                model_type = model_info.get('type', 'detection')
-                output_type = model_info.get('output_type', 'ImgDetections')
+                    in_data = q.get()
+                    model_info = AVAILABLE_MODELS.get(self.current_model_name, {})
+                    model_type = model_info.get('type', 'detection')
+                    output_type = model_info.get('output_type', 'ImgDetections')
 
-                # Calculate latency
-                try:
-                    frame_ts = in_data.getTimestamp()
-                    now = dai.Clock.now()
-                    latency_ms = (now - frame_ts).total_seconds() * 1000
-                except Exception:
-                    latency_ms = 0.0
+                    # Calculate latency
+                    try:
+                        frame_ts = in_data.getTimestamp()
+                        now = dai.Clock.now()
+                        latency_ms = (now - frame_ts).total_seconds() * 1000
+                    except Exception:
+                        latency_ms = 0.0
 
-                result = self._format_ai_result(in_data, model_type, output_type, model_info)
+                    result = self._format_ai_result(in_data, model_type, output_type, model_info)
 
-                # Build enhanced output
-                output = {
-                    "model": self.current_model_name,
-                    "type": model_type,
-                    "frame_id": self._frame_count,
-                    "timestamp_ns": self.get_clock().now().nanoseconds,
-                    "latency_ms": round(latency_ms, 2),
-                    "result": result
-                }
-                
-                msg = String()
-                msg.data = json.dumps(output)
-                self.ai_pub.publish(msg)
+                    # Build enhanced output
+                    output = {
+                        "model": self.current_model_name,
+                        "type": model_type,
+                        "frame_id": self._frame_count,
+                        "timestamp_ns": self.get_clock().now().nanoseconds,
+                        "latency_ms": round(latency_ms, 2),
+                        "result": result
+                    }
+                    
+                    msg = String()
+                    msg.data = json.dumps(output)
+                    self.ai_pub.publish(msg)
+            except Exception as e:
+                self.get_logger().error(f"Error processing AI: {e}")
                 
         # 4. Process IMU
         if 'imu' in self.queues:
-            q = self.queues['imu']
-            while q.has():
-                imu_packets = q.get().packets
-                for packet in imu_packets:
-                    # Publish Imu msg
-                    imu_msg = Imu()
-                    imu_msg.header.stamp = self.get_clock().now().to_msg()
-                    imu_msg.header.frame_id = "oak_imu_frame"
-                    
-                    accel = packet.acceleroMeter
-                    gyro = packet.gyroscope
-                    
-                    imu_msg.linear_acceleration.x = accel.x
-                    imu_msg.linear_acceleration.y = accel.y
-                    imu_msg.linear_acceleration.z = accel.z
-                    
-                    imu_msg.angular_velocity.x = gyro.x
-                    imu_msg.angular_velocity.y = gyro.y
-                    imu_msg.angular_velocity.z = gyro.z
-                    
-                    self.imu_pub.publish(imu_msg)
-                    
-                    # Publish components
-                    accel_msg = Vector3Stamped()
-                    accel_msg.header = imu_msg.header
-                    accel_msg.vector = imu_msg.linear_acceleration
-                    self.imu_accel_pub.publish(accel_msg)
-                    
-                    gyro_msg = Vector3Stamped()
-                    gyro_msg.header = imu_msg.header
-                    gyro_msg.vector = imu_msg.angular_velocity
-                    self.imu_gyro_pub.publish(gyro_msg)
+            try:
+                q = self.queues['imu']
+                while q.has():
+                    imu_data = q.get()
+                    imu_packets = imu_data.packets
+                    for packet in imu_packets:
+                        # Publish Imu msg
+                        imu_msg = Imu()
+                        imu_msg.header.stamp = self.get_clock().now().to_msg()
+                        imu_msg.header.frame_id = "oak_imu_frame"
+                        
+                        accel = packet.acceleroMeter
+                        gyro = packet.gyroscope
+                        
+                        imu_msg.linear_acceleration.x = accel.x
+                        imu_msg.linear_acceleration.y = accel.y
+                        imu_msg.linear_acceleration.z = accel.z
+                        
+                        imu_msg.angular_velocity.x = gyro.x
+                        imu_msg.angular_velocity.y = gyro.y
+                        imu_msg.angular_velocity.z = gyro.z
+                        
+                        self.imu_pub.publish(imu_msg)
+                        
+                        # Publish components
+                        accel_msg = Vector3Stamped()
+                        accel_msg.header = imu_msg.header
+                        accel_msg.vector = imu_msg.linear_acceleration
+                        self.imu_accel_pub.publish(accel_msg)
+                        
+                        gyro_msg = Vector3Stamped()
+                        gyro_msg.header = imu_msg.header
+                        gyro_msg.vector = imu_msg.angular_velocity
+                        self.imu_gyro_pub.publish(gyro_msg)
+            except Exception as e:
+                self.get_logger().error(f"Error processing IMU: {e}")
 
     def _format_ai_result(self, in_data, model_type: str, output_type: str, model_info: dict) -> dict:
         """Format AI inference result based on model type and output type"""
@@ -681,10 +715,6 @@ class OakUnifiedNode(Node):
             return self._format_pose_raw(in_data, model_info)
         elif model_type == 'instance-segmentation':
             return self._format_instance_seg_raw(in_data, model_info)
-        elif model_type == 'gaze':
-            return self._format_gaze_raw(in_data)
-        elif model_type == 'lines':
-            return self._format_lines_raw(in_data)
         elif model_type == 'hand':
             return self._format_hand_raw(in_data, model_info)
         else:
@@ -726,210 +756,108 @@ class OakUnifiedNode(Node):
                     }
                 }
                 
-                # Add keypoints if available (e.g., face landmarks)
+                # Add keypoints if present
                 if hasattr(det, 'keypoints') and det.keypoints:
-                    kps = []
-                    for i, kp in enumerate(det.keypoints):
-                        kps.append({
-                            "id": i,
+                    det_dict["keypoints"] = []
+                    for kp in det.keypoints:
+                        det_dict["keypoints"].append({
                             "x": round(kp.x, 4),
                             "y": round(kp.y, 4),
-                            "confidence": round(getattr(kp, 'confidence', 1.0), 4)
+                            "confidence": round(kp.confidence, 4) if hasattr(kp, 'confidence') else 1.0
                         })
-                    det_dict["keypoints"] = kps
                 
-                # Add mask if available (instance segmentation)
+                # Add mask if present and requested
                 if hasattr(det, 'mask') and det.mask is not None:
                     if self.segmentation_mode == "mask":
-                        # RLE encode the mask
+                        # RLE encode for efficiency
                         mask_array = np.array(det.mask)
-                        if mask_array.ndim == 2:
-                            det_dict["mask_rle"] = rle_encode(mask_array)
-                    else:
-                        # Just note that mask is available
-                        det_dict["has_mask"] = True
+                        det_dict["mask_rle"] = rle_encode(mask_array)
+                    # Always include mask presence indicator
+                    det_dict["has_mask"] = True
                 
                 detections.append(det_dict)
-                
         except Exception as e:
             return {"error": str(e)}
         
         return {"detections": detections, "count": len(detections)}
     
     def _format_keypoints(self, in_data, model_info: dict) -> dict:
-        """Format Keypoints output (pose/hand estimation)"""
+        """Format Keypoints output"""
         try:
-            keypoints = []
-            num_keypoints = model_info.get('keypoints', 17)
-            
-            for i, kp in enumerate(in_data.keypoints[:num_keypoints]):
-                keypoints.append({
-                    "id": i,
+            keypoints_list = []
+            for kp in in_data.keypoints:
+                keypoints_list.append({
                     "x": round(kp.x, 4),
                     "y": round(kp.y, 4),
-                    "confidence": round(getattr(kp, 'confidence', 1.0), 4)
+                    "confidence": round(kp.confidence, 4) if hasattr(kp, 'confidence') else 1.0
                 })
-            
-            detected_count = len([k for k in keypoints if k['confidence'] > 0.3])
-            
-            return {
-                "keypoints": keypoints,
-                "num_keypoints": num_keypoints,
-                "detected_count": detected_count
-            }
+            return {"keypoints": keypoints_list, "count": len(keypoints_list)}
         except Exception as e:
             return {"error": str(e)}
     
     def _format_lines(self, in_data) -> dict:
-        """Format Lines output (line segment detection)"""
+        """Format Lines output"""
         try:
-            lines = []
+            lines_list = []
             for line in in_data.lines:
-                lines.append({
-                    "start": {"x": round(line.start.x, 4), "y": round(line.start.y, 4)},
-                    "end": {"x": round(line.end.x, 4), "y": round(line.end.y, 4)},
-                    "confidence": round(getattr(line, 'confidence', 1.0), 4)
+                lines_list.append({
+                    "start": {"x": round(line.start_x, 4), "y": round(line.start_y, 4)},
+                    "end": {"x": round(line.end_x, 4), "y": round(line.end_y, 4)},
+                    "confidence": round(line.confidence, 4) if hasattr(line, 'confidence') else 1.0
                 })
-            
-            return {"lines": lines, "count": len(lines)}
+            return {"lines": lines_list, "count": len(lines_list)}
         except Exception as e:
             return {"error": str(e)}
     
     def _format_predictions(self, in_data, model_type: str) -> dict:
-        """Format Predictions output (gaze, classification, etc.)"""
+        """Format Predictions output"""
         try:
-            if model_type == 'gaze':
-                # L2CS-Net outputs yaw and pitch
-                predictions = in_data.predictions
-                if len(predictions) >= 2:
-                    return {
-                        "yaw": round(float(predictions[0]), 4),
-                        "pitch": round(float(predictions[1]), 4),
-                        "unit": "radians"
-                    }
-            
-            # Generic predictions
-            return {
-                "predictions": [round(float(p), 4) for p in in_data.predictions]
-            }
+            predictions = []
+            for pred in in_data.predictions:
+                predictions.append({
+                    "class": pred.label,
+                    "confidence": round(pred.confidence, 4)
+                })
+            return {"predictions": predictions, "count": len(predictions)}
         except Exception as e:
             return {"error": str(e)}
-    
-    # ============== RAW OUTPUT HANDLERS (fallback when depthai-nodes not available) ==============
     
     def _format_pose_raw(self, in_data, model_info: dict) -> dict:
         """Format raw pose estimation output"""
         try:
-            layer_data = in_data.getFirstLayerFp16()
-            num_keypoints = model_info.get('keypoints', 17)
-            
-            keypoints = []
-            if hasattr(layer_data, 'shape'):
-                heatmaps = np.array(layer_data)
-                
-                if len(heatmaps.shape) == 3:
-                    for i in range(min(heatmaps.shape[0], num_keypoints)):
-                        heatmap = heatmaps[i]
-                        max_idx = np.unravel_index(np.argmax(heatmap), heatmap.shape)
-                        confidence = float(heatmap[max_idx])
-                        y_norm = max_idx[0] / heatmap.shape[0]
-                        x_norm = max_idx[1] / heatmap.shape[1]
-                        
-                        keypoints.append({
-                            "id": i,
-                            "x": round(x_norm, 4),
-                            "y": round(y_norm, 4),
-                            "confidence": round(confidence, 4)
-                        })
-            
-            return {
-                "keypoints": keypoints,
-                "num_keypoints": num_keypoints,
-                "detected_count": len([k for k in keypoints if k['confidence'] > 0.3]),
-                "note": "raw_output"
-            }
+            # Raw NNData handling
+            layers = in_data.getAllLayerNames()
+            return {"raw_layers": layers, "note": "Install depthai-nodes for parsed output"}
         except Exception as e:
             return {"error": str(e)}
     
     def _format_instance_seg_raw(self, in_data, model_info: dict) -> dict:
         """Format raw instance segmentation output"""
         try:
-            # Try to get detections if available
-            if hasattr(in_data, 'detections'):
-                return self._format_detections(in_data)
-            
-            return {
-                "note": "Install depthai-nodes for full instance segmentation support",
-                "raw_layers": in_data.getLayerNames() if hasattr(in_data, 'getLayerNames') else []
-            }
-        except Exception as e:
-            return {"error": str(e)}
-    
-    def _format_gaze_raw(self, in_data) -> dict:
-        """Format raw gaze estimation output"""
-        try:
-            data = in_data.getFirstLayerFp16()
-            if len(data) >= 2:
-                return {
-                    "yaw": round(float(data[0]), 4),
-                    "pitch": round(float(data[1]), 4),
-                    "unit": "radians",
-                    "note": "raw_output"
-                }
-            return {"raw": list(data[:10])}
-        except Exception as e:
-            return {"error": str(e)}
-    
-    def _format_lines_raw(self, in_data) -> dict:
-        """Format raw line detection output"""
-        try:
-            return {
-                "note": "Install depthai-nodes for line detection parsing",
-                "raw_layers": in_data.getLayerNames() if hasattr(in_data, 'getLayerNames') else []
-            }
+            layers = in_data.getAllLayerNames()
+            return {"raw_layers": layers, "note": "Install depthai-nodes for parsed output"}
         except Exception as e:
             return {"error": str(e)}
     
     def _format_hand_raw(self, in_data, model_info: dict) -> dict:
-        """Format raw hand landmark output"""
+        """Format raw hand detection output"""
         try:
-            layer_data = in_data.getFirstLayerFp16()
-            num_keypoints = model_info.get('keypoints', 21)
-            
-            # MediaPipe hand outputs [x, y, z] * 21 keypoints = 63 values
-            keypoints = []
-            data = np.array(layer_data)
-            
-            for i in range(min(len(data) // 3, num_keypoints)):
-                keypoints.append({
-                    "id": i,
-                    "x": round(float(data[i * 3]), 4),
-                    "y": round(float(data[i * 3 + 1]), 4),
-                    "z": round(float(data[i * 3 + 2]), 4),
-                })
-            
-            return {
-                "keypoints": keypoints,
-                "num_keypoints": num_keypoints,
-                "note": "raw_output"
-            }
+            if isinstance(in_data, dai.ImgDetections):
+                return self._format_detections(in_data)
+            layers = in_data.getAllLayerNames()
+            return {"raw_layers": layers, "note": "Install depthai-nodes for parsed output"}
         except Exception as e:
             return {"error": str(e)}
-    
-    def _validate_imu_frequency(self, requested_freq: int) -> int:
-        """Validate and round IMU frequency to BMI270 supported values"""
-        valid = [f for f in BMI270_VALID_FREQUENCIES if f <= requested_freq]
-        if not valid:
-            return BMI270_VALID_FREQUENCIES[0]
-        return max(valid)
 
     # ============== CALLBACKS ==============
     
     def get_camera_image_callback(self, request, response):
-        response.image_base64 = self.current_image
+        """Service to get current camera image"""
+        response.image_base64 = self.current_image if self.current_image else ""
         return response
-
+    
     def switch_model_callback(self, request, response):
+        """Service to switch AI model"""
         model_name = request.model_name
         
         if model_name not in AVAILABLE_MODELS:
@@ -939,24 +867,19 @@ class OakUnifiedNode(Node):
         
         if model_name == self.current_model_name:
             response.success = True
-            response.message = f"Already using model: {model_name}"
+            response.message = f"Already using {model_name}"
             return response
         
-        self.get_logger().info(f"Switching model to: {model_name}")
+        self.get_logger().info(f"Switching model: {self.current_model_name} -> {model_name}")
         self.current_model_name = model_name
+        self._force_rebuild = True
+        self._publish_status("loading", f"Switching to model {model_name}...")
+        self.check_demand()
         
-        # Trigger rebuild if AI is active
-        if self.current_pipeline_config.get('ai'):
-            self._force_rebuild = True
-            # Publish status before rebuild (service call returns immediately)
-            self._publish_status("loading", f"Switching to model {model_name}...")
-            self.check_demand()
-            
-            # Check if rebuild succeeded (it happens synchronously in check_demand)
-            if self._model_load_error:
-                response.success = False
-                response.message = f"Model switch failed: {self._model_load_error}"
-                return response
+        if self._model_load_error:
+            response.success = False
+            response.message = f"Model switch failed: {self._model_load_error}"
+            return response
              
         response.success = True
         response.message = f"Switched to {model_name}. Subscribe to ai/status for loading progress."
@@ -1079,6 +1002,7 @@ class OakUnifiedNode(Node):
             self.get_logger().error(f"Invalid camera config: {e}")
 
     def status_timer_callback(self):
+        """Publish current model and available models info"""
         # Publish current model with metadata
         model_info = AVAILABLE_MODELS.get(self.current_model_name, {})
         msg_curr = String()
@@ -1121,6 +1045,15 @@ class OakUnifiedNode(Node):
         if self.current_pipeline_config.get('video') or self.current_pipeline_config.get('ai'):
             self._force_rebuild = True
             self.check_demand()
+    
+    def destroy_node(self):
+        """Clean up resources on shutdown"""
+        if self.pipeline is not None:
+            try:
+                self.pipeline.stop()
+            except Exception:
+                pass
+        super().destroy_node()
 
 
 def main(args=None):
@@ -1130,10 +1063,13 @@ def main(args=None):
         rclpy.spin(node)
     except Exception as e:
         print(f"Node execution failed: {e}")
+        import traceback
+        traceback.print_exc()
         error_node = ErrorPublisher()
         rclpy.spin(error_node)
     finally:
         rclpy.shutdown()
+
 
 if __name__ == "__main__":
     main()

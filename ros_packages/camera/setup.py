@@ -12,10 +12,10 @@ setup(
     ],
     install_requires=[
         "setuptools",
-        "depthai",
+        "depthai>=3.0.0",
+        "depthai-nodes",
         "opencv-python",
         "numpy",
-        "blobconverter",
     ],
     zip_safe=True,
     maintainer="iftach",
