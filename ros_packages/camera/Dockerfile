@@ -9,7 +9,8 @@ RUN set -xe \
     && apt-get update \
     && apt-get install -y python3-pip
 
-RUN pip install depthai==2.31.0.0 opencv-python numpy blobconverter
+# DepthAI v3 for Model Hub support (NNModelDescription, getModelFromZoo)
+RUN pip install --upgrade depthai opencv-python numpy
 
 RUN cd ros2_ws && \
     source /opt/ros/humble/setup.bash && \
