@@ -4,10 +4,12 @@ SHELL ["/bin/bash", "-c"]
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install --no-install-recommends -y curl
+RUN apt-get update && apt-get install --no-install-recommends -y curl gnupg ca-certificates
 
-RUN curl -sSL https://download.tinkerforge.com/apt/$(. /etc/os-release; echo $ID)/tinkerforge.gpg | apt-key add - && \
-    echo "deb https://download.tinkerforge.com/apt/$(. /etc/os-release; echo $ID $VERSION_CODENAME) main" > /etc/apt/sources.list.d/tinkerforge.list && \
+# Tinkerforge repository setup (modern approach without deprecated apt-key)
+RUN mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://download.tinkerforge.com/apt/$(. /etc/os-release; echo $ID)/tinkerforge.gpg -o /etc/apt/keyrings/tinkerforge.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/tinkerforge.gpg] https://download.tinkerforge.com/apt/$(. /etc/os-release; echo $ID $VERSION_CODENAME) main" > /etc/apt/sources.list.d/tinkerforge.list && \
     apt-get update --fix-missing && \
     apt-get install --no-install-recommends -y \
         build-essential \
