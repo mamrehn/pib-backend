@@ -419,7 +419,8 @@ class OakUnifiedNode(Node):
                 # --- Camera & Video ---
                 needs_camera = config['video'] or config['ai']
                 camera_node = None
-                camera_output = None
+                camera_output_bgr = None  # For AI (needs BGR)
+                camera_output_nv12 = None  # For VideoEncoder (needs NV12)
 
                 if needs_camera:
                     # Create camera with v3 API
@@ -427,17 +428,25 @@ class OakUnifiedNode(Node):
                         dai.CameraBoardSocket.CAM_A
                     )
                     
-                    # Request output at specified resolution
-                    camera_output = camera_node.requestOutput(
-                        (self.preview_width, self.preview_height),
-                        type=dai.ImgFrame.Type.BGR888p
-                    )
+                    # Request NV12 output for video encoding (VideoEncoder requires NV12)
+                    if config['video']:
+                        camera_output_nv12 = camera_node.requestOutput(
+                            (self.preview_width, self.preview_height),
+                            type=dai.ImgFrame.Type.NV12
+                        )
+                    
+                    # Request BGR output for AI processing
+                    if config['ai']:
+                        camera_output_bgr = camera_node.requestOutput(
+                            (self.preview_width, self.preview_height),
+                            type=dai.ImgFrame.Type.BGR888p
+                        )
 
                     # Video Output - MJPEG encoder
                     if config['video']:
                         # Create video encoder with v3 API
                         video_encoder = pipeline.create(dai.node.VideoEncoder).build(
-                            camera_output,
+                            camera_output_nv12,
                             frameRate=self.video_fps,
                             profile=dai.VideoEncoderProperties.Profile.MJPEG
                         )
@@ -499,7 +508,7 @@ class OakUnifiedNode(Node):
                                     nn = pipeline.create(dai.node.NeuralNetwork)
                                     nn.setNNModelDescription(model_desc)
                                     nn.input.setBlocking(False)
-                                    camera_output.link(nn.input)
+                                    camera_output_bgr.link(nn.input)
                                     
                                     self.queues['nn'] = nn.out.createOutputQueue(
                                         maxSize=4, blocking=False
@@ -510,7 +519,7 @@ class OakUnifiedNode(Node):
                                 nn = pipeline.create(dai.node.NeuralNetwork)
                                 nn.setNNModelDescription(model_desc)
                                 nn.input.setBlocking(False)
-                                camera_output.link(nn.input)
+                                camera_output_bgr.link(nn.input)
                                 
                                 self.queues['nn'] = nn.out.createOutputQueue(
                                     maxSize=4, blocking=False
