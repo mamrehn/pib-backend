@@ -4,21 +4,18 @@ SHELL ["/bin/bash", "-c"]
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install --no-install-recommends -y curl gnupg ca-certificates
-
-# Tinkerforge repository setup (modern approach without deprecated apt-key)
-RUN mkdir -p /etc/apt/keyrings && \
-    curl -fsSL https://download.tinkerforge.com/apt/$(. /etc/os-release; echo $ID)/tinkerforge.gpg -o /etc/apt/keyrings/tinkerforge.gpg && \
-    echo "deb [signed-by=/etc/apt/keyrings/tinkerforge.gpg] https://download.tinkerforge.com/apt/$(. /etc/os-release; echo $ID $VERSION_CODENAME) main" > /etc/apt/sources.list.d/tinkerforge.list && \
-    apt-get update --fix-missing && \
+# Install build dependencies (tinkerforge via pip instead of apt - server unreliable)
+RUN apt-get update && \
     apt-get install --no-install-recommends -y \
         build-essential \
         python3-colcon-common-extensions \
         python3-colcon-mixin \
         python3-pip \
-        python3-tinkerforge \
         libusb-1.0-0-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Install tinkerforge from PyPI (more reliable than apt repository)
+RUN pip install tinkerforge
 
 
 # ToDo - DEV MERGE: COPY ./ros_packages/requirements.txt .
