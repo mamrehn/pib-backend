@@ -11,7 +11,9 @@ from datatypes.srv import PlayAudioFromFile, PlayAudioFromSpeech, ClearPlaybackQ
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from std_msgs.msg import String
+from rclpy.node import Node
+from std_msgs.msg import String, Int16MultiArray
+import array
 
 from public_api_client import public_voice_client
 from . import util
@@ -138,11 +140,45 @@ class AudioPlayerNode(Node):
             String, "public_api_token", self.get_public_api_token_listener, 10
         )
 
+        # subscriber for streaming audio playback (e.g. from browser)
+        # Expected format: Int16MultiArray, 16kHz, Mono, 16-bit
+        self.audio_playback_sub = self.create_subscription(
+            Int16MultiArray, 
+            "audio_playback", 
+            self.receive_audio_stream_listener, 
+            10
+        )
+
         self.get_logger().info("Now running AUDIO PLAYER")
 
     def get_public_api_token_listener(self, msg):
         token = msg.data
         self.token = token
+
+    def receive_audio_stream_listener(self, msg: Int16MultiArray):
+        """
+        Callback for /audio_playback topic.
+        Expects Int16MultiArray (list of 16-bit signed integers).
+        Assumes 16000 Hz, 1 Channel, which matches SPEECH_ENCODING.
+        """
+        # Convert list of ints to bytes
+        try:
+            # array module is efficient for this
+            data_bytes = array.array('h', msg.data).tobytes()
+        except Exception as e:
+            self.get_logger().error(f"Failed to convert audio stream data: {e}")
+            return
+
+        order = self.counter_next()
+        
+        # Create playback item with 0 pause to ensure continuous streaming
+        item = PlaybackItem(
+            data=[data_bytes], 
+            encoding=SPEECH_ENCODING, 
+            pause_seconds=0.0, 
+            order=order
+        )
+        self.playback_queue.put(item, True)
 
     def counter_next(self) -> int:
         with self.counter_lock:
