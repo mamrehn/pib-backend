@@ -18,7 +18,7 @@ from default_pose_constants import STARTUP_POSITIONS, CALIBRATION_POSITIONS
 
 
 def _populate_db() -> None:
-    _create_bricklet_data()
+    _upsert_bricklet_data()
     _create_camera_data()
     _create_program_data()
     _create_chat_data_and_assistant()
@@ -53,7 +53,7 @@ def _is_empty_db() -> bool:
     return True
 
 
-def _create_bricklet_data() -> None:
+def _upsert_bricklet_data() -> None:
     data = _get_motor_list()
     motor_settings = {
         "pulse_width_min": 700,
@@ -70,7 +70,14 @@ def _create_bricklet_data() -> None:
     }
 
     for item in data:
-        motor = Motor(name=item["name"], **motor_settings)
+        motor = Motor.query.filter_by(name=item["name"]).first()
+        if not motor:
+            motor = Motor(name=item["name"], **motor_settings)
+            db.session.add(motor)
+        else:
+            for key, value in motor_settings.items():
+                setattr(motor, key, value)
+        
         if motor.name == "tilt_forward_motor":
             motor.rotation_range_min = -4500
             motor.rotation_range_max = 4500
@@ -84,13 +91,14 @@ def _create_bricklet_data() -> None:
         elif motor.name in ["upper_arm_left_rotation", "upper_arm_right_rotation"]:
             motor.velocity = 10000
 
-        db.session.add(motor)
         db.session.flush()
 
-        bricklet_pins: [Tuple[int, int]] = item["bricklet_pins"]
-        for bricklet_pin in bricklet_pins:
-            bricklet_id, pin = bricklet_pin
+        # Re-create bricklet pins for this motor
+        BrickletPin.query.filter_by(motor_id=motor.id).delete()
 
+        bricklet_pins: [Tuple[int, int]] = item["bricklet_pins"]
+        for bricklet_pin_info in bricklet_pins:
+            bricklet_id, pin = bricklet_pin_info
             invert = False
             db.session.add(
                 BrickletPin(
@@ -99,15 +107,20 @@ def _create_bricklet_data() -> None:
             )
         db.session.flush()
 
-    b1 = Bricklet(bricklet_number=1, type="Servo Bricklet")
-    b2 = Bricklet(bricklet_number=2, type="Servo Bricklet")
-    b3 = Bricklet(bricklet_number=3, type="Servo Bricklet")
-    b4 = Bricklet(bricklet_number=4, type="Solid State Relay Bricklet")
-    db.session.add_all([b1, b2, b3, b4])
+    # Upsert Bricklets
+    for i in range(1, 4):
+        if not Bricklet.query.filter_by(bricklet_number=i).first():
+            db.session.add(Bricklet(bricklet_number=i, type="Servo Bricklet"))
+            
+    if not Bricklet.query.filter_by(bricklet_number=4).first():
+        db.session.add(Bricklet(bricklet_number=4, type="Solid State Relay Bricklet"))
+        
     db.session.flush()
 
 
 def _create_camera_data() -> None:
+    if CameraSettings.query.first():
+        return
     camera_settings = CameraSettings(
         resolution="SD", refresh_rate=0.1, quality_factor=80, res_x=640, res_y=480
     )
@@ -116,6 +129,8 @@ def _create_camera_data() -> None:
 
 
 def _create_program_data() -> None:
+    if Program.query.filter_by(name="hello_world").first():
+        return
     program = Program(
         name="hello_world",
         code_visual=_get_example_program(),
@@ -126,82 +141,104 @@ def _create_program_data() -> None:
 
 
 def _create_chat_data_and_assistant() -> None:
-    gpt4o1 = AssistantModel(
-        visual_name="GPT-4o [Vision]", api_name="gpt-4o", has_image_support=True
-    )
-    gpt4o2 = AssistantModel(
-        visual_name="GPT-4o [Text]", api_name="gpt-4o", has_image_support=False
-    )
-    gpt3 = AssistantModel(
-        visual_name="GPT-3.5 [Text]", api_name="gpt-3.5-turbo", has_image_support=False
-    )
-    claude = AssistantModel(
-        visual_name="Claude 3 Sonnet [Vision]",
-        api_name="anthropic.claude-3-sonnet-20240229-v1:0",
-        has_image_support=True,
-    )
-    gemini_text = AssistantModel(
-        visual_name="Gemini 2.5 Flash",
-        api_name="gemini-2.5-flash",
-        has_image_support=False,
-    )
-    db.session.add_all([gpt4o2, gpt4o1, gpt3, claude, gemini_text])
+    # Assistants
+    assistants = [
+        ("gpt-4o", "GPT-4o [Vision]", True),
+        ("gpt-4o", "GPT-4o [Text]", False),
+        ("gpt-3.5-turbo", "GPT-3.5 [Text]", False),
+        ("anthropic.claude-3-sonnet-20240229-v1:0", "Claude 3 Sonnet [Vision]", True),
+        ("gemini-2.5-flash", "Gemini 2.5 Flash", False),
+    ]
+    
+    for api_name, visual_name, has_image_support in assistants:
+        if not AssistantModel.query.filter_by(visual_name=visual_name).first():
+            db.session.add(AssistantModel(
+                visual_name=visual_name, api_name=api_name, has_image_support=has_image_support
+            ))
     db.session.flush()
 
-    p_eva = Personality(
-        name="Eva",
-        personality_id="8f73b580-927e-41c2-98ac-e5df070e7288",
-        gender="Female",
-        pause_threshold=0.8,
-        message_history=5,
-        assistant_model_id=claude.id,
-    )
-    p_thomas = Personality(
-        name="Thomas",
-        personality_id="8b310f95-92cd-4512-b42a-d3fe29c4bb8a",
-        gender="Male",
-        pause_threshold=1.0,
-        message_history=15,
-        assistant_model_id=gpt4o1.id,
-    )
-    db.session.add_all([p_eva, p_thomas])
+    claude = AssistantModel.query.filter_by(visual_name="Claude 3 Sonnet [Vision]").first()
+    gpt4o1 = AssistantModel.query.filter_by(visual_name="GPT-4o [Vision]").first()
+    
+    if not claude or not gpt4o1:
+        return
+
+    if not Personality.query.filter_by(name="Eva").first():
+        p_eva = Personality(
+            name="Eva",
+            personality_id="8f73b580-927e-41c2-98ac-e5df070e7288",
+            gender="Female",
+            pause_threshold=0.8,
+            message_history=5,
+            assistant_model_id=claude.id,
+        )
+        db.session.add(p_eva)
+
+    if not Personality.query.filter_by(name="Thomas").first():
+        p_thomas = Personality(
+            name="Thomas",
+            personality_id="8b310f95-92cd-4512-b42a-d3fe29c4bb8a",
+            gender="Male",
+            pause_threshold=1.0,
+            message_history=15,
+            assistant_model_id=gpt4o1.id,
+        )
+        db.session.add(p_thomas)
     db.session.flush()
 
-    c1 = Chat(
-        chat_id="b4f01552-0c09-401c-8fde-fda753fb0261",
-        topic="Nuernberg",
-        personality_id="8f73b580-927e-41c2-98ac-e5df070e7288",
-    )
-    c2 = Chat(
-        chat_id="ee3e80f9-c8f7-48c2-9f15-449ba9bbe4ab",
-        topic="Home-Office",
-        personality_id="8b310f95-92cd-4512-b42a-d3fe29c4bb8a",
-    )
-    db.session.add_all([c1, c2])
+    if not Chat.query.filter_by(topic="Nuernberg").first():
+        c1 = Chat(
+            chat_id="b4f01552-0c09-401c-8fde-fda753fb0261",
+            topic="Nuernberg",
+            personality_id="8f73b580-927e-41c2-98ac-e5df070e7288",
+        )
+        db.session.add(c1)
+        
+    if not Chat.query.filter_by(topic="Home-Office").first():
+        c2 = Chat(
+            chat_id="ee3e80f9-c8f7-48c2-9f15-449ba9bbe4ab",
+            topic="Home-Office",
+            personality_id="8b310f95-92cd-4512-b42a-d3fe29c4bb8a",
+        )
+        db.session.add(c2)
     db.session.flush()
 
-    m1 = ChatMessage(
-        message_id="539ed3e6-9e3d-11ee-8c90-0242ac120002",
-        is_user=True,
-        content="hello pib!",
-        chat_id="b4f01552-0c09-401c-8fde-fda753fb0261",
-    )
-    m2 = ChatMessage(
-        message_id="0a080706-9e3e-11ee-8c90-0242ac120002",
-        is_user=False,
-        content="hello user!",
-        chat_id="b4f01552-0c09-401c-8fde-fda753fb0261",
-    )
-    db.session.add_all([m1, m2])
+    if not ChatMessage.query.filter_by(message_id="539ed3e6-9e3d-11ee-8c90-0242ac120002").first():
+        m1 = ChatMessage(
+            message_id="539ed3e6-9e3d-11ee-8c90-0242ac120002",
+            is_user=True,
+            content="hello pib!",
+            chat_id="b4f01552-0c09-401c-8fde-fda753fb0261",
+        )
+        db.session.add(m1)
+        
+    if not ChatMessage.query.filter_by(message_id="0a080706-9e3e-11ee-8c90-0242ac120002").first():
+        m2 = ChatMessage(
+            message_id="0a080706-9e3e-11ee-8c90-0242ac120002",
+            is_user=False,
+            content="hello user!",
+            chat_id="b4f01552-0c09-401c-8fde-fda753fb0261",
+        )
+        db.session.add(m2)
     db.session.flush()
 
 
 def _create_default_poses() -> None:
-    startup_pose = Pose(name="Startup/Resting", deletable=False)
-    calibration_pose = Pose(name="Calibration", deletable=False)
+    startup_pose = Pose.query.filter_by(name="Startup/Resting").first()
+    if not startup_pose:
+        startup_pose = Pose(name="Startup/Resting", deletable=False)
+        db.session.add(startup_pose)
+            
+    calibration_pose = Pose.query.filter_by(name="Calibration").first()
+    if not calibration_pose:
+        calibration_pose = Pose(name="Calibration", deletable=False)
+        db.session.add(calibration_pose)
 
-    db.session.add_all([startup_pose, calibration_pose])
     db.session.flush()
+
+    # Clear existing positions for these poses to ensure fresh data on reset
+    MotorPosition.query.filter_by(pose_id=startup_pose.pose_id).delete()
+    MotorPosition.query.filter_by(pose_id=calibration_pose.pose_id).delete()
 
     motors = _get_motor_list()
 
@@ -209,7 +246,7 @@ def _create_default_poses() -> None:
         MotorPosition(
             position=STARTUP_POSITIONS.get(motor["name"], 0),
             motor_name=motor["name"],
-            pose_id=startup_pose.id,
+            pose_id=startup_pose.pose_id,
         )
         for motor in motors
     ]
@@ -218,7 +255,7 @@ def _create_default_poses() -> None:
         MotorPosition(
             position=CALIBRATION_POSITIONS.get(motor["name"], 0),
             motor_name=motor["name"],
-            pose_id=calibration_pose.id,
+            pose_id=calibration_pose.pose_id,
         )
         for motor in motors
     ]
