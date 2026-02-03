@@ -17,19 +17,28 @@ from model.motor_position_model import MotorPosition
 from default_pose_constants import STARTUP_POSITIONS, CALIBRATION_POSITIONS
 
 
-@app.cli.command("seed_db")
-def seed_db() -> None:
-    if not _is_empty_db():
-        print("Seeding database failed - database already contains data.")
-        return
+def _populate_db() -> None:
     _create_bricklet_data()
     _create_camera_data()
     _create_program_data()
     _create_chat_data_and_assistant()
     _create_default_poses()
     db.session.commit()
+
+@app.cli.command("seed_db")
+def seed_db() -> None:
+    if not _is_empty_db():
+        print("Seeding database failed - database already contains data.")
+        return
+    _populate_db()
     print("Seeded the database with default data.")
 
+@app.cli.command("reset_db")
+def reset_db() -> None:
+    if not _is_empty_db():
+        print("Warning: Database already contains data.")
+    _populate_db()
+    print("Reset the database with default data.")
 
 def _is_empty_db() -> bool:
     inspector = inspect(db.engine)
