@@ -22,18 +22,30 @@ from default_pose_constants import (
 )
 
 
-@app.cli.command("seed_db")
-def seed_db() -> None:
-    if not _is_empty_db():
-        print("Seeding database failed - database already contains data.")
-        return
+def _populate_db() -> None:
     _create_bricklet_data()
     _create_camera_data()
     _create_program_data()
     _create_chat_data_and_assistant()
     _create_default_poses()
     db.session.commit()
+
+
+@app.cli.command("seed_db")
+def seed_db() -> None:
+    if not _is_empty_db():
+        print("Seeding database failed - database already contains data.")
+        return
+    _populate_db()
     print("Seeded the database with default data.")
+
+
+@app.cli.command("reset_db")
+def reset_db() -> None:
+    if not _is_empty_db():
+        print("Warning: Database already contains data.")
+    _populate_db()
+    print("Reset the database with default data.")
 
 
 def _is_empty_db() -> bool:
@@ -66,7 +78,14 @@ def _create_bricklet_data() -> None:
     }
 
     for item in data:
-        motor = Motor(name=item["name"], **motor_settings)
+        motor = Motor.query.filter_by(name=item["name"]).first()
+        is_new = motor is None
+        if is_new:
+            motor = Motor(name=item["name"], **motor_settings)
+        else:
+            for key, value in motor_settings.items():
+                setattr(motor, key, value)
+
         if motor.name == "tilt_forward_motor":
             motor.rotation_range_min = -4500
             motor.rotation_range_max = 4500
@@ -80,8 +99,12 @@ def _create_bricklet_data() -> None:
         elif motor.name in ["upper_arm_left_rotation", "upper_arm_right_rotation"]:
             motor.velocity = 10000
 
-        db.session.add(motor)
+        if is_new:
+            db.session.add(motor)
         db.session.flush()
+
+        # Re-create bricklet pins for this motor
+        BrickletPin.query.filter_by(motor_id=motor.id).delete()
 
         bricklet_pins: [Tuple[int, int]] = item["bricklet_pins"]
         for bricklet_pin in bricklet_pins:
@@ -95,15 +118,20 @@ def _create_bricklet_data() -> None:
             )
         db.session.flush()
 
-    b1 = Bricklet(bricklet_number=1, type="Servo Bricklet")
-    b2 = Bricklet(bricklet_number=2, type="Servo Bricklet")
-    b3 = Bricklet(bricklet_number=3, type="Servo Bricklet")
-    b4 = Bricklet(bricklet_number=4, type="Solid State Relay Bricklet")
-    db.session.add_all([b1, b2, b3, b4])
+    # Upsert Bricklets
+    for i in range(1, 4):
+        if not Bricklet.query.filter_by(bricklet_number=i).first():
+            db.session.add(Bricklet(bricklet_number=i, type="Servo Bricklet"))
+
+    if not Bricklet.query.filter_by(bricklet_number=4).first():
+        db.session.add(Bricklet(bricklet_number=4, type="Solid State Relay Bricklet"))
+
     db.session.flush()
 
 
 def _create_camera_data() -> None:
+    if CameraSettings.query.first():
+        return
     camera_settings = CameraSettings(
         resolution="SD", refresh_rate=0.1, quality_factor=80, res_x=640, res_y=480
     )
@@ -112,6 +140,8 @@ def _create_camera_data() -> None:
 
 
 def _create_program_data() -> None:
+    if Program.query.filter_by(name="hello_world").first():
+        return
     program = Program(
         name="hello_world",
         code_visual=_get_example_program(),
@@ -122,6 +152,8 @@ def _create_program_data() -> None:
 
 
 def _create_chat_data_and_assistant() -> None:
+    if AssistantModel.query.first():
+        return
     gpt4o1 = AssistantModel(
         visual_name="GPT-4o [Vision]", api_name="gpt-4o", has_image_support=True
     )
@@ -193,11 +225,21 @@ def _create_chat_data_and_assistant() -> None:
 
 
 def _create_default_poses() -> None:
-    startup_pose = Pose(name=STARTUP_POSE_NAME, deletable=False)
-    calibration_pose = Pose(name=CALIBRATION_POSE_NAME, deletable=False)
+    startup_pose = Pose.query.filter_by(name=STARTUP_POSE_NAME).first()
+    if not startup_pose:
+        startup_pose = Pose(name=STARTUP_POSE_NAME, deletable=False)
+        db.session.add(startup_pose)
+        db.session.flush()
 
-    db.session.add_all([startup_pose, calibration_pose])
-    db.session.flush()
+    calibration_pose = Pose.query.filter_by(name=CALIBRATION_POSE_NAME).first()
+    if not calibration_pose:
+        calibration_pose = Pose(name=CALIBRATION_POSE_NAME, deletable=False)
+        db.session.add(calibration_pose)
+        db.session.flush()
+
+    # Clear existing positions for these poses to ensure fresh data on reset
+    MotorPosition.query.filter_by(pose_id=startup_pose.id).delete()
+    MotorPosition.query.filter_by(pose_id=calibration_pose.id).delete()
 
     motors = _get_motor_list()
 
@@ -220,7 +262,7 @@ def _create_default_poses() -> None:
     ]
 
     db.session.add_all(startup_positions + calibration_positions)
-    db.session.commit()
+    db.session.flush()
 
 
 def _get_motor_list() -> [dict[str, Any]]:
