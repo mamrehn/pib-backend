@@ -5,6 +5,7 @@ serving the legacy upstream topics (``camera_topic``, ``face_center``, the
 ``*_topic`` control subscriptions) alongside the new ``camera/*`` namespace.
 """
 
+import json
 import os
 import sys
 import types
@@ -254,6 +255,89 @@ class TestImuFrequencyValidation(unittest.TestCase):
         self.assertEqual(node._validate_imu_frequency(120), 100)
         self.assertEqual(node._validate_imu_frequency(1000), 400)
         self.assertEqual(node._validate_imu_frequency(1), 25)
+
+
+@patch("ros_packages.camera.oak_d_lite.stereo.cv2.CascadeClassifier")
+@patch("ros_packages.camera.oak_d_lite.stereo.dai")
+@patch("ros_packages.camera.oak_d_lite.stereo.os.path.exists", return_value=True)
+class TestFailedFeatureIsNotRetriedEveryTick(unittest.TestCase):
+    """A feature that cannot be built must not rebuild the pipeline in a loop.
+
+    init_pipeline drops AI/IMU from the config when they fail, but the
+    subscriber that asked for them is still there, so without a latch
+    check_demand would see a mismatch and tear colour and depth down again on
+    the very next timer tick.
+    """
+
+    def _node(self, ai=0, imu=0):
+        node = _make_node()
+        node.ai_pub = MagicMock()
+        node.ai_pub.get_subscription_count.return_value = ai
+        for pub in ("imu_pub", "imu_accel_pub", "imu_gyro_pub"):
+            mock = MagicMock()
+            mock.get_subscription_count.return_value = imu
+            setattr(node, pub, mock)
+        return node
+
+    def test_failed_ai_model_is_not_rebuilt_until_it_changes(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = self._node(ai=1)
+
+        def fail_ai(config):
+            node.pipeline_config = {"ai": False, "imu": False}
+            node._ai_failed_model = node.current_model_name
+            node._model_load_error = "boom"
+            return True
+
+        node._restart_pipeline = MagicMock(side_effect=fail_ai)
+
+        node.check_demand()
+        self.assertEqual(node._restart_pipeline.call_count, 1)
+
+        # Subsequent ticks must leave the device alone.
+        for _ in range(5):
+            node.check_demand()
+        self.assertEqual(node._restart_pipeline.call_count, 1)
+
+        # Selecting a different model clears the latch, so the new one is
+        # attempted exactly once; failing again re-latches on that model.
+        request = MagicMock()
+        request.model_name = "person"
+        node.pipeline_config = {"ai": True, "imu": False}
+        node.switch_model_callback(request, MagicMock())
+
+        self.assertEqual(node._restart_pipeline.call_count, 2)
+        self.assertEqual(node._ai_failed_model, "person")
+
+        for _ in range(5):
+            node.check_demand()
+        self.assertEqual(node._restart_pipeline.call_count, 2)
+
+    def test_unavailable_imu_is_not_rebuilt_until_reconfigured(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = self._node(imu=1)
+
+        def fail_imu(config):
+            node.pipeline_config = {"ai": False, "imu": False}
+            node._imu_unavailable = True
+            return True
+
+        node._restart_pipeline = MagicMock(side_effect=fail_imu)
+
+        node.check_demand()
+        self.assertEqual(node._restart_pipeline.call_count, 1)
+
+        for _ in range(5):
+            node.check_demand()
+        self.assertEqual(node._restart_pipeline.call_count, 1)
+
+        # A new frequency is a fresh attempt.
+        msg = MagicMock()
+        msg.data = json.dumps({"frequency": 200})
+        node.imu_config_callback(msg)
+        self.assertFalse(node._imu_unavailable)
 
 
 class TestModelRegistryConsistency(unittest.TestCase):

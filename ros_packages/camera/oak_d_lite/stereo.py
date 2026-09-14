@@ -299,6 +299,11 @@ class CameraNode(Node):
         self.current_model_name = DEFAULT_MODEL
         self._model_loading = False
         self._model_load_error: Optional[str] = None
+        # A model that fails to build must not be retried on every tick: that
+        # would tear down colour and depth ~10x a second. Remember the model
+        # that failed and stop asking for it until the selection changes.
+        self._ai_failed_model: Optional[str] = None
+        self._imu_unavailable = False
 
         # AI settings.
         self.ai_confidence = 0.5
@@ -467,6 +472,7 @@ class CameraNode(Node):
         )
         self.current_model_name = model_name
         self._model_load_error = None
+        self._ai_failed_model = None
         self._publish_status("loading", f"Switching to model {model_name}...")
 
         if self.pipeline_config.get("ai"):
@@ -609,10 +615,12 @@ class CameraNode(Node):
                 try:
                     self._init_ai(self.camRgb)
                     self._model_load_error = None
+                    self._ai_failed_model = None
                 except Exception as ai_exc:
                     # AI is optional: keep colour/depth/IMU running without it.
                     self.get_logger().error(f"AI model not available: {ai_exc}")
                     self._model_load_error = str(ai_exc)
+                    self._ai_failed_model = self.current_model_name
                     config["ai"] = False
                     self.queues.pop("nn", None)
                     self.queues.pop("nn_passthrough", None)
@@ -624,6 +632,7 @@ class CameraNode(Node):
                     self._init_imu()
                 except Exception as imu_exc:
                     self.get_logger().warning(f"IMU not available: {imu_exc}")
+                    self._imu_unavailable = True
                     config["imu"] = False
                     self.queues.pop("imu", None)
 
@@ -676,12 +685,15 @@ class CameraNode(Node):
 
     def check_demand(self):
         """Enable/disable the on-demand AI and IMU branches of the pipeline."""
-        need_ai = self.ai_pub.get_subscription_count() > 0
+        need_ai = (
+            self.ai_pub.get_subscription_count() > 0
+            and self.current_model_name != self._ai_failed_model
+        )
         need_imu = (
             self.imu_pub.get_subscription_count() > 0
             or self.imu_accel_pub.get_subscription_count() > 0
             or self.imu_gyro_pub.get_subscription_count() > 0
-        )
+        ) and not self._imu_unavailable
         new_config = {"ai": need_ai, "imu": need_imu}
 
         changed = new_config != self.pipeline_config
@@ -1153,6 +1165,7 @@ class CameraNode(Node):
                 if actual != self.imu_actual_freq:
                     self.imu_freq = requested
                     self.imu_actual_freq = actual
+                    self._imu_unavailable = False
                     self.get_logger().info(f"IMU frequency set to {actual}Hz")
 
                     if self.pipeline_config.get("imu"):
@@ -1188,6 +1201,8 @@ class CameraNode(Node):
                 ):
                     self.get_logger().info(f"AI Config: Switching to {model_name}")
                     self.current_model_name = model_name
+                    self._ai_failed_model = None
+                    self._model_load_error = None
                     rebuild_needed = True
                 elif model_name not in AVAILABLE_MODELS:
                     self.get_logger().error(f"Unknown model: {model_name}")
