@@ -37,6 +37,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 	"srv/GetCameraImage.srv"
 	"srv/GetDepthFrame.srv"
 	"srv/GetDistanceAtPx.srv"
+	"srv/SwitchModel.srv"
 	"srv/VisionPrompt.srv"
 	"srv/ApplyJointTrajectory.srv"
 	"srv/GetJointPosition.srv"

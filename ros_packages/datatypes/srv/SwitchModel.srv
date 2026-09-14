@@ -1,0 +1,5 @@
+# Name of a model from the AVAILABLE_MODELS registry in oak_d_lite/stereo.py.
+string model_name
+---
+bool success
+string message

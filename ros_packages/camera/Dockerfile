@@ -36,8 +36,14 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
 # depthai upgraded to 3.8.0: migrated from v2 Pipeline API to v3 Node API.
 # The ISP output path continues to work correctly (preview path was black on 2.25).
 # See Jira PR-1484 for migration details.
+# depthai-nodes supplies the parsers for Model Hub networks that emit
+# richer outputs than ImgDetections (pose, segmentation, keypoints,
+# lines, gaze). It is installed in the same pip invocation so the
+# resolver keeps it consistent with the pinned depthai; stereo.py falls
+# back to the raw NeuralNetwork output path if the import is missing.
 RUN pip install --break-system-packages --no-cache-dir --ignore-installed \
         depthai==3.8.0 \
+        depthai-nodes \
         "opencv-python-headless<5"
 
 # stereo.py needs cv2.data.haarcascades at runtime for face detection
