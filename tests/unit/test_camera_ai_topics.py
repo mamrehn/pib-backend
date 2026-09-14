@@ -256,5 +256,28 @@ class TestImuFrequencyValidation(unittest.TestCase):
         self.assertEqual(node._validate_imu_frequency(1), 25)
 
 
+class TestModelRegistryConsistency(unittest.TestCase):
+    """The node registry and the pre-download script must not drift apart."""
+
+    def _script_slugs(self):
+        sys.path.insert(
+            0,
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "../../scripts")),
+        )
+        from download_oak_models import DEFAULT_MODELS, MODEL_CATEGORIES, MODEL_SLUGS
+
+        return MODEL_SLUGS, MODEL_CATEGORIES, DEFAULT_MODELS
+
+    def test_slugs_match_the_node_registry(self):
+        slugs, _, _ = self._script_slugs()
+        node_slugs = {name: info["slug"] for name, info in AVAILABLE_MODELS.items()}
+        self.assertEqual(node_slugs, slugs)
+
+    def test_every_model_is_categorised_and_defaults_exist(self):
+        slugs, categories, defaults = self._script_slugs()
+        self.assertEqual(set(slugs), set(categories))
+        self.assertTrue(set(defaults).issubset(set(slugs)))
+
+
 if __name__ == "__main__":
     unittest.main()
