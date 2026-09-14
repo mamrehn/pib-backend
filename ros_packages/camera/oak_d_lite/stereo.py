@@ -132,8 +132,17 @@ DEFAULT_MODEL = "yolov6n"
 # Valid IMU frequencies for the BMI270 sensor.
 BMI270_VALID_FREQUENCIES = [25, 50, 100, 200, 400]
 
-# Colour and depth are always part of the pipeline; only these are negotiated.
-DEFAULT_PIPELINE_CONFIG = {"ai": False, "imu": False}
+# Colour is always part of the pipeline; these branches are negotiated.
+#
+# StereoDepth and the neural network cannot coexist on the OAK-D Lite: stereo
+# reserves SHAVE cores 10-13 and its ImageManip a further one, leaving six for
+# inference, while the Model Hub blobs are compiled for eight. Requesting both
+# builds a pipeline that only fails at pipeline.start(). Depth is therefore the
+# resting state and yields to AI while AI is subscribed.
+DEFAULT_PIPELINE_CONFIG = {"depth": True, "ai": False, "imu": False}
+
+# Seconds between attempts to rebuild a pipeline that failed to start.
+PIPELINE_RECOVERY_INTERVAL = 5.0
 
 
 def rle_encode(mask: np.ndarray) -> Dict[str, Any]:
@@ -295,6 +304,18 @@ class CameraNode(Node):
         self._force_rebuild = False
         self._pipeline_lock = threading.RLock()
 
+        # Pipeline health. A pipeline that fails to start leaves the node
+        # publishing nothing, so check_demand() retries on a backoff instead of
+        # waiting for subscriber demand to change.
+        self._pipeline_ok = False
+        self._next_recovery_attempt = 0.0
+
+        # Depth state. _depth_enabled is the operator override from
+        # camera/video/config; _depth_unavailable latches a device that cannot
+        # provide stereo at all.
+        self._depth_enabled = True
+        self._depth_unavailable = False
+
         # Model state.
         self.current_model_name = DEFAULT_MODEL
         self._model_loading = False
@@ -316,6 +337,7 @@ class CameraNode(Node):
         self.imu_actual_freq = self._validate_imu_frequency(100)
 
         self.camera_available = self.init_pipeline()
+        self._pipeline_ok = self.camera_available
 
         if self.camera_available:
             self.get_camera_image_service = self.create_service(
@@ -579,95 +601,125 @@ class CameraNode(Node):
         imu.setMaxBatchReports(10)
         self.queues["imu"] = imu.out.createOutputQueue(maxSize=50, blocking=False)
 
+    def _compose_pipeline(self, config) -> None:
+        """Create every node for ``config``. Raises if construction fails."""
+        self.pipeline = dai.Pipeline()
+        self.camRgb = self.pipeline.create(dai.node.Camera)
+        self.camRgb.build(dai.CameraBoardSocket.CAM_A)
+        self.isp_out = self.camRgb.requestIspOutput()
+
+        self.queue = self.isp_out.createOutputQueue()
+        self.depth_queue = None
+        self.queues = {}
+
+        if config.get("depth"):
+            try:
+                self._init_stereo_depth()
+            except Exception as stereo_exc:
+                # A device that cannot do stereo at all must not be retried.
+                self.get_logger().warning(f"Stereo depth not available: {stereo_exc}")
+                self._depth_unavailable = True
+                config["depth"] = False
+                self.depth_queue = None
+
+        if config.get("ai"):
+            # Deliberately not guarded: a neural network that cannot be placed
+            # usually fails at pipeline.start(), not here, so init_pipeline()
+            # owns the fallback for both cases.
+            self._model_loading = True
+            try:
+                self._init_ai(self.camRgb)
+            finally:
+                self._model_loading = False
+
+        if config.get("imu"):
+            try:
+                self._init_imu()
+            except Exception as imu_exc:
+                self.get_logger().warning(f"IMU not available: {imu_exc}")
+                self._imu_unavailable = True
+                config["imu"] = False
+                self.queues.pop("imu", None)
+
+    def _teardown_pipeline(self) -> None:
+        """Drop every handle to a pipeline that is not running."""
+        if self.pipeline is not None:
+            try:
+                self.pipeline.stop()
+            except Exception:
+                pass
+        self.pipeline = None
+        self.queue = None
+        self.depth_queue = None
+        self.queues = {}
+
     def init_pipeline(self) -> bool:
         """
         Build and start the single device pipeline.
 
-        Colour ISP and StereoDepth are always present; AI and IMU are added when
-        ``self.pipeline_config`` asks for them. ``pipeline.start()`` is called
-        exactly once (OAK-D-Lite 1-pipeline constraint).
+        Colour ISP is always present; depth, AI and IMU come from
+        ``self.pipeline_config``. ``pipeline.start()`` is called exactly once
+        per successful build (OAK-D-Lite 1-pipeline constraint).
+
+        SHAVE exhaustion from an over-subscribed pipeline is only reported by
+        the device at start(), never at node construction. So when a start with
+        AI enabled fails, the model is latched as unusable and the pipeline is
+        rebuilt without it rather than leaving the camera dead.
         """
         config = dict(getattr(self, "pipeline_config", DEFAULT_PIPELINE_CONFIG))
-        self.queues = {}
-        try:
-            # depthai v3 API:
-            # Camera node replaces deprecated ColorCamera.
-            # XLinkOut is completely removed in DepthAI v3.
-            # Output queues are created directly from node outputs.
-            # Colour ISP, StereoDepth, the optional neural network and the
-            # optional IMU all share this single pipeline.
-            self.pipeline = dai.Pipeline()
-            self.camRgb = self.pipeline.create(dai.node.Camera)
-            self.camRgb.build(dai.CameraBoardSocket.CAM_A)
-            self.isp_out = self.camRgb.requestIspOutput()
 
-            self.queue = self.isp_out.createOutputQueue()
-            self.depth_queue = None
-
+        for attempt in (1, 2):
             try:
-                self._init_stereo_depth()
-            except Exception as stereo_exc:
-                self.get_logger().warning(f"Stereo depth not available: {stereo_exc}")
-                self.depth_queue = None
+                self._compose_pipeline(config)
+                self.pipeline.start()
+            except Exception as exc:
+                self._teardown_pipeline()
 
-            if config.get("ai"):
-                self._model_loading = True
-                try:
-                    self._init_ai(self.camRgb)
-                    self._model_load_error = None
-                    self._ai_failed_model = None
-                except Exception as ai_exc:
-                    # AI is optional: keep colour/depth/IMU running without it.
-                    self.get_logger().error(f"AI model not available: {ai_exc}")
-                    self._model_load_error = str(ai_exc)
-                    self._ai_failed_model = self.current_model_name
+                if attempt == 1 and config.get("ai"):
+                    model = getattr(self, "current_model_name", DEFAULT_MODEL)
+                    self.get_logger().error(
+                        f"Pipeline failed to start with model {model} ({exc}). "
+                        "Retrying without AI."
+                    )
+                    self._model_load_error = str(exc)
+                    self._ai_failed_model = model
+                    config = dict(config)
                     config["ai"] = False
-                    self.queues.pop("nn", None)
-                    self.queues.pop("nn_passthrough", None)
-                finally:
-                    self._model_loading = False
+                    # Depth was dropped to make room for the model; restore it.
+                    config["depth"] = getattr(
+                        self, "_depth_enabled", True
+                    ) and not getattr(self, "_depth_unavailable", False)
+                    continue
 
-            if config.get("imu"):
-                try:
-                    self._init_imu()
-                except Exception as imu_exc:
-                    self.get_logger().warning(f"IMU not available: {imu_exc}")
-                    self._imu_unavailable = True
-                    config["imu"] = False
-                    self.queues.pop("imu", None)
+                import traceback
 
-            self.pipeline.start()
+                print("====================================")
+                print("CAMERA INIT FAILED")
+                traceback.print_exc()
+                print("====================================")
+
+                self.get_logger().error(f"Camera not found: {exc}")
+                self.pipeline_config = dict(config)
+                self._pipeline_ok = False
+                return False
+
             self.pipeline_config = config
-
-            self.get_logger().info("DepthAI v3 pipeline started successfully.")
+            self._pipeline_ok = True
+            if not config.get("depth"):
+                # Do not let get_depth_frame serve a frame from a previous build.
+                self.current_depth = None
+            active = [k for k, v in config.items() if v] or ["colour only"]
+            self.get_logger().info(
+                f"DepthAI v3 pipeline started successfully: {', '.join(active)}"
+            )
             return True
 
-        except Exception as e:
-            import traceback
-
-            print("====================================")
-            print("CAMERA INIT FAILED")
-            traceback.print_exc()
-            print("====================================")
-
-            self.get_logger().error(f"Camera not found: {e}")
-            self.pipeline = None
-            self.queue = None
-            self.depth_queue = None
-            self.queues = {}
-            self.pipeline_config = dict(DEFAULT_PIPELINE_CONFIG)
-            return False
+        return False
 
     def _restart_pipeline(self, config) -> bool:
         """Stop the running pipeline and rebuild it with ``config``."""
         with self._pipeline_lock:
-            if self.pipeline is not None:
-                try:
-                    self.pipeline.stop()
-                except Exception as e:
-                    self.get_logger().warning(f"Error stopping pipeline: {e}")
-                self.pipeline = None
-
+            self._teardown_pipeline()
             self.pipeline_config = dict(config)
             ok = self.init_pipeline()
 
@@ -684,7 +736,13 @@ class CameraNode(Node):
             return ok
 
     def check_demand(self):
-        """Enable/disable the on-demand AI and IMU branches of the pipeline."""
+        """Reconcile the running pipeline with current subscriber demand.
+
+        Depth is the resting state and yields to AI whenever anything is
+        subscribed to camera/ai/detections, because the two cannot share the
+        device's SHAVE cores. Unsubscribing gives depth back, so the two modes
+        switch on the fly at the cost of one pipeline rebuild (a few seconds).
+        """
         need_ai = (
             self.ai_pub.get_subscription_count() > 0
             and self.current_model_name != self._ai_failed_model
@@ -694,21 +752,41 @@ class CameraNode(Node):
             or self.imu_accel_pub.get_subscription_count() > 0
             or self.imu_gyro_pub.get_subscription_count() > 0
         ) and not self._imu_unavailable
-        new_config = {"ai": need_ai, "imu": need_imu}
+        need_depth = self._depth_enabled and not self._depth_unavailable and not need_ai
+        new_config = {"depth": need_depth, "ai": need_ai, "imu": need_imu}
 
         changed = new_config != self.pipeline_config
         if self._force_rebuild:
             changed = True
             self._force_rebuild = False
 
-        if not changed:
+        # A pipeline that failed to start publishes nothing and, since its
+        # config already matches demand, would never be rebuilt by the check
+        # above. Retry it on a backoff instead of staying dead until restart.
+        now = time.monotonic()
+        recovering = not self._pipeline_ok and now >= self._next_recovery_attempt
+
+        if not (changed or recovering):
             return
 
-        self.get_logger().info(f"Demand changed: {new_config}. Rebuilding pipeline...")
+        self._next_recovery_attempt = now + PIPELINE_RECOVERY_INTERVAL
+
+        if recovering and not changed:
+            self.get_logger().warning("Pipeline is not running; retrying build...")
+        else:
+            self.get_logger().info(
+                f"Demand changed: {new_config}. Rebuilding pipeline..."
+            )
         if need_ai:
             self._publish_status(
                 "loading", f"Loading model {self.current_model_name}..."
             )
+            if self._depth_enabled and not self._depth_unavailable:
+                self.get_logger().info(
+                    "Suspending stereo depth while AI inference is subscribed "
+                    "(the OAK-D Lite cannot run both)."
+                )
+
         self._restart_pipeline(new_config)
 
     # ============== PROCESSING ==============
@@ -1131,6 +1209,9 @@ class CameraNode(Node):
                 "active": self.pipeline_config.get("ai", False),
                 "loading": self._model_loading,
                 "error": self._model_load_error,
+                "depth_active": self.pipeline_config.get("depth", False),
+                "imu_active": self.pipeline_config.get("imu", False),
+                "pipeline_ok": self._pipeline_ok,
             }
         )
         self.ai_current_pub.publish(msg_curr)
@@ -1245,9 +1326,27 @@ class CameraNode(Node):
             self.get_logger().error(f"Invalid AI config: {e}")
 
     def camera_config_callback(self, msg):
-        """Handle camera/video config: {"quality": 80, "resolution": [1280, 720]}."""
+        """Handle camera/video config.
+
+        {"quality": 80, "resolution": [1280, 720], "depth": true}
+
+        ``depth`` is an operator override: setting it false keeps StereoDepth
+        out of the pipeline permanently, freeing its SHAVE cores so AI can stay
+        resident. It does not survive a node restart.
+        """
         try:
             config = json.loads(msg.data)
+
+            if "depth" in config:
+                wanted = bool(config["depth"])
+                if wanted != self._depth_enabled:
+                    self._depth_enabled = wanted
+                    self.get_logger().info(
+                        f"Stereo depth {'enabled' if wanted else 'disabled'} "
+                        "by camera/video/config"
+                    )
+                    self._force_rebuild = True
+                    self.check_demand()
 
             if "quality" in config:
                 self.quality_factor = max(1, min(100, int(config["quality"])))

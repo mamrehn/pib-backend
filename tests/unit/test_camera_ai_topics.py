@@ -170,12 +170,16 @@ class TestOnDemandPipeline(unittest.TestCase):
     def test_ai_subscriber_triggers_rebuild(self, mock_exists, mock_dai, mock_casc):
         node = self._node_with_demand(ai=1)
         node.check_demand()
-        node._restart_pipeline.assert_called_once_with({"ai": True, "imu": False})
+        node._restart_pipeline.assert_called_once_with(
+            {"depth": False, "ai": True, "imu": False}
+        )
 
     def test_imu_subscriber_triggers_rebuild(self, mock_exists, mock_dai, mock_casc):
         node = self._node_with_demand(imu=1)
         node.check_demand()
-        node._restart_pipeline.assert_called_once_with({"ai": False, "imu": True})
+        node._restart_pipeline.assert_called_once_with(
+            {"depth": True, "ai": False, "imu": True}
+        )
 
     def test_force_rebuild_flag_is_consumed(self, mock_exists, mock_dai, mock_casc):
         node = self._node_with_demand()
@@ -285,7 +289,7 @@ class TestFailedFeatureIsNotRetriedEveryTick(unittest.TestCase):
         node = self._node(ai=1)
 
         def fail_ai(config):
-            node.pipeline_config = {"ai": False, "imu": False}
+            node.pipeline_config = {"depth": True, "ai": False, "imu": False}
             node._ai_failed_model = node.current_model_name
             node._model_load_error = "boom"
             return True
@@ -304,7 +308,7 @@ class TestFailedFeatureIsNotRetriedEveryTick(unittest.TestCase):
         # attempted exactly once; failing again re-latches on that model.
         request = MagicMock()
         request.model_name = "person"
-        node.pipeline_config = {"ai": True, "imu": False}
+        node.pipeline_config = {"depth": False, "ai": True, "imu": False}
         node.switch_model_callback(request, MagicMock())
 
         self.assertEqual(node._restart_pipeline.call_count, 2)
@@ -320,7 +324,7 @@ class TestFailedFeatureIsNotRetriedEveryTick(unittest.TestCase):
         node = self._node(imu=1)
 
         def fail_imu(config):
-            node.pipeline_config = {"ai": False, "imu": False}
+            node.pipeline_config = {"depth": True, "ai": False, "imu": False}
             node._imu_unavailable = True
             return True
 
@@ -338,6 +342,206 @@ class TestFailedFeatureIsNotRetriedEveryTick(unittest.TestCase):
         msg.data = json.dumps({"frequency": 200})
         node.imu_config_callback(msg)
         self.assertFalse(node._imu_unavailable)
+
+
+@patch("ros_packages.camera.oak_d_lite.stereo.cv2.CascadeClassifier")
+@patch("ros_packages.camera.oak_d_lite.stereo.dai")
+@patch("ros_packages.camera.oak_d_lite.stereo.os.path.exists", return_value=True)
+class TestDepthAiArbitration(unittest.TestCase):
+    """Depth and AI cannot share the OAK-D Lite, so they swap on demand."""
+
+    def _node(self, ai=0):
+        node = _make_node()
+        node.ai_pub = MagicMock()
+        node.ai_pub.get_subscription_count.return_value = ai
+        for pub in ("imu_pub", "imu_accel_pub", "imu_gyro_pub"):
+            m = MagicMock()
+            m.get_subscription_count.return_value = 0
+            setattr(node, pub, m)
+
+        def apply(cfg):
+            node.pipeline_config = dict(cfg)
+            node._pipeline_ok = True
+            return True
+
+        node._restart_pipeline = MagicMock(side_effect=apply)
+        return node
+
+    def test_depth_is_the_resting_state(self, mock_exists, mock_dai, mock_casc):
+        node = self._node()
+        node.check_demand()
+        self.assertTrue(node.pipeline_config["depth"])
+        self.assertFalse(node.pipeline_config["ai"])
+
+    def test_ai_subscription_suspends_depth_and_unsubscribing_restores_it(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = self._node(ai=1)
+        node.check_demand()
+        self.assertEqual(
+            node.pipeline_config, {"depth": False, "ai": True, "imu": False}
+        )
+
+        # switching back on the fly is just the demand going away
+        node.ai_pub.get_subscription_count.return_value = 0
+        node.check_demand()
+        self.assertEqual(
+            node.pipeline_config, {"depth": True, "ai": False, "imu": False}
+        )
+        self.assertEqual(node._restart_pipeline.call_count, 2)
+
+    def test_depth_can_be_disabled_by_operator_override(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = self._node()
+        msg = MagicMock()
+        msg.data = json.dumps({"depth": False})
+        node.camera_config_callback(msg)
+
+        self.assertFalse(node._depth_enabled)
+        self.assertFalse(node.pipeline_config["depth"])
+
+    def test_unavailable_depth_is_not_retried(self, mock_exists, mock_dai, mock_c):
+        node = self._node()
+        node._depth_unavailable = True
+        node.check_demand()
+        self.assertFalse(node.pipeline_config["depth"])
+
+
+@patch("ros_packages.camera.oak_d_lite.stereo.cv2.CascadeClassifier")
+@patch("ros_packages.camera.oak_d_lite.stereo.dai")
+@patch("ros_packages.camera.oak_d_lite.stereo.os.path.exists", return_value=True)
+class TestPipelineStartFailureRecovery(unittest.TestCase):
+    """SHAVE exhaustion is only reported at pipeline.start()."""
+
+    def _bare(self, ai=True):
+        with patch.object(CameraNode, "__init__", lambda self: None):
+            node = CameraNode()
+        node.get_logger = MagicMock()
+        node.pipeline_config = {"depth": not ai, "ai": ai, "imu": False}
+        node.current_model_name = "yolov6n"
+        node.current_depth = "stale"
+        node._depth_enabled = True
+        node._depth_unavailable = False
+        node._imu_unavailable = False
+        node._model_loading = False
+        node._model_load_error = None
+        node._ai_failed_model = None
+        node._pipeline_ok = False
+        node._init_ai = MagicMock()
+        node._init_stereo_depth = MagicMock()
+        node._init_imu = MagicMock()
+        return node
+
+    def test_ai_start_failure_falls_back_to_a_running_pipeline(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = self._bare()
+        pipeline = MagicMock()
+        mock_dai.Pipeline.return_value = pipeline
+        pipeline.start.side_effect = [
+            RuntimeError(
+                "NeuralNetwork: Blob compiled for 8 shaves, "
+                "but only 6 are available in current configuration."
+            ),
+            None,
+        ]
+
+        ok = node.init_pipeline()
+
+        # the camera must survive a model that cannot be placed
+        self.assertTrue(ok)
+        self.assertTrue(node._pipeline_ok)
+        self.assertEqual(pipeline.start.call_count, 2)
+        # the failed model is latched on the outer path, ending the retry loop
+        self.assertEqual(node._ai_failed_model, "yolov6n")
+        # and depth reclaims the cores the model was going to use
+        self.assertEqual(
+            node.pipeline_config, {"depth": True, "ai": False, "imu": False}
+        )
+
+    def test_total_failure_reports_not_ok_without_a_third_attempt(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = self._bare()
+        pipeline = MagicMock()
+        mock_dai.Pipeline.return_value = pipeline
+        pipeline.start.side_effect = RuntimeError("device gone")
+
+        ok = node.init_pipeline()
+
+        self.assertFalse(ok)
+        self.assertFalse(node._pipeline_ok)
+        self.assertEqual(pipeline.start.call_count, 2)
+        self.assertIsNone(node.queue)
+
+    def test_stale_depth_is_dropped_when_depth_leaves_the_pipeline(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = self._bare(ai=False)
+        node.pipeline_config = {"depth": False, "ai": False, "imu": False}
+        mock_dai.Pipeline.return_value = MagicMock()
+
+        node.init_pipeline()
+
+        self.assertIsNone(node.current_depth)
+
+
+@patch("ros_packages.camera.oak_d_lite.stereo.cv2.CascadeClassifier")
+@patch("ros_packages.camera.oak_d_lite.stereo.dai")
+@patch("ros_packages.camera.oak_d_lite.stereo.os.path.exists", return_value=True)
+class TestDeadPipelineSelfHeals(unittest.TestCase):
+    """A failed pipeline used to stay dead until the container was restarted."""
+
+    def _node(self):
+        node = _make_node()
+        node.ai_pub = MagicMock()
+        node.ai_pub.get_subscription_count.return_value = 0
+        for pub in ("imu_pub", "imu_accel_pub", "imu_gyro_pub"):
+            m = MagicMock()
+            m.get_subscription_count.return_value = 0
+            setattr(node, pub, m)
+        node._restart_pipeline = MagicMock(return_value=False)
+        return node
+
+    def test_down_pipeline_is_retried_even_though_demand_is_unchanged(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = self._node()
+        # exactly the state the old code got stuck in: config matches demand,
+        # but nothing is running
+        node._pipeline_ok = False
+        node._next_recovery_attempt = 0.0
+        node.pipeline_config = {"depth": True, "ai": False, "imu": False}
+
+        node.check_demand()
+        node._restart_pipeline.assert_called_once()
+
+    def test_retries_are_rate_limited(self, mock_exists, mock_dai, mock_casc):
+        node = self._node()
+        node._pipeline_ok = False
+        node._next_recovery_attempt = 0.0
+        node.pipeline_config = {"depth": True, "ai": False, "imu": False}
+
+        node.check_demand()
+        for _ in range(20):
+            node.check_demand()
+        self.assertEqual(node._restart_pipeline.call_count, 1)
+
+        # once the backoff expires it tries again
+        node._next_recovery_attempt = 0.0
+        node.check_demand()
+        self.assertEqual(node._restart_pipeline.call_count, 2)
+
+    def test_healthy_pipeline_is_left_alone(self, mock_exists, mock_dai, mock_c):
+        node = self._node()
+        node._pipeline_ok = True
+        node._next_recovery_attempt = 0.0
+        node.pipeline_config = {"depth": True, "ai": False, "imu": False}
+
+        for _ in range(10):
+            node.check_demand()
+        node._restart_pipeline.assert_not_called()
 
 
 class TestModelRegistryConsistency(unittest.TestCase):
