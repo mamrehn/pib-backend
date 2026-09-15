@@ -8,6 +8,7 @@ serving the legacy upstream topics (``camera_topic``, ``face_center``, the
 import json
 import os
 import sys
+import time
 import types
 import unittest
 from unittest.mock import MagicMock, patch
@@ -59,6 +60,7 @@ else:
 
 import numpy as np
 
+from ros_packages.camera.oak_d_lite import stereo as stereo_module
 from ros_packages.camera.oak_d_lite.stereo import AVAILABLE_MODELS, CameraNode
 
 
@@ -542,6 +544,442 @@ class TestDeadPipelineSelfHeals(unittest.TestCase):
         for _ in range(10):
             node.check_demand()
         node._restart_pipeline.assert_not_called()
+
+
+def _demand_node(ai=0):
+    node = _make_node()
+    node.ai_pub = MagicMock()
+    node.ai_pub.get_subscription_count.return_value = ai
+    for pub in ("imu_pub", "imu_accel_pub", "imu_gyro_pub"):
+        m = MagicMock()
+        m.get_subscription_count.return_value = 0
+        setattr(node, pub, m)
+    return node
+
+
+@patch("ros_packages.camera.oak_d_lite.stereo.cv2.CascadeClassifier")
+@patch("ros_packages.camera.oak_d_lite.stereo.dai")
+@patch("ros_packages.camera.oak_d_lite.stereo.os.path.exists", return_value=True)
+class TestFrameWatchdog(unittest.TestCase):
+    """DepthAI auto-reconnects a crashed device, hiding a dead camera.
+
+    On the robot the OAK-D Lite crash-looped every ~8 s for 90 minutes while the
+    node reported pipeline_ok and published nothing. Health must come from
+    frames.
+    """
+
+    def _silent_node(self, config, ai=0):
+        node = _demand_node(ai=ai)
+        node._restart_pipeline = MagicMock(return_value=True)
+        node.queue = MagicMock()
+        node._pipeline_ok = True
+        node.pipeline_config = dict(config)
+        stale = time.monotonic() - stereo_module.FRAME_WATCHDOG_SECONDS - 1
+        node._pipeline_started_at = stale
+        node._last_colour_frame_at = 0.0
+        return node
+
+    def test_silent_pipeline_with_depth_drops_depth(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = self._silent_node({"depth": True, "ai": False, "imu": False})
+
+        node.check_demand()
+
+        self.assertTrue(node._depth_unavailable)
+        node._restart_pipeline.assert_called_once_with(
+            {"depth": False, "ai": False, "imu": False}
+        )
+
+    def test_silent_pipeline_with_ai_unloads_the_model(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = self._silent_node({"depth": False, "ai": True, "imu": False}, ai=1)
+
+        node.check_demand()
+
+        self.assertEqual(node._ai_failed_model, node.current_model_name)
+        self.assertFalse(node._depth_unavailable)
+        node._restart_pipeline.assert_called_once()
+
+    def test_silent_colour_only_pipeline_is_marked_down_and_rebuilt(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = _demand_node()
+        node._restart_pipeline = MagicMock(return_value=True)
+        node.queue = MagicMock()
+        node._pipeline_ok = True
+        node._depth_unavailable = True
+        node.pipeline_config = {"depth": False, "ai": False, "imu": False}
+        node._pipeline_started_at = (
+            time.monotonic() - stereo_module.FRAME_WATCHDOG_SECONDS - 1
+        )
+
+        node.check_demand()
+
+        node._restart_pipeline.assert_called_once()
+
+    def test_fresh_frames_keep_the_pipeline(self, mock_exists, mock_dai, mock_c):
+        node = self._silent_node({"depth": True, "ai": False, "imu": False})
+        node._last_colour_frame_at = time.monotonic()
+
+        for _ in range(5):
+            node.check_demand()
+
+        self.assertFalse(node._depth_unavailable)
+        node._restart_pipeline.assert_not_called()
+
+    def test_new_pipeline_gets_a_grace_period(self, mock_exists, mock_dai, mock_c):
+        node = self._silent_node({"depth": True, "ai": False, "imu": False})
+        node._pipeline_started_at = time.monotonic()
+
+        node.check_demand()
+
+        node._restart_pipeline.assert_not_called()
+
+    def test_timer_records_colour_frames(self, mock_exists, mock_dai, mock_casc):
+        node = _demand_node()
+        node.publish_face_center = MagicMock()
+        node._publish_color_frame = MagicMock()
+        image = MagicMock()
+        image.getCvFrame.return_value = np.zeros((720, 1280, 3), dtype=np.uint8)
+        node.queue = MagicMock()
+        node.queue.tryGet.return_value = image
+        before = time.monotonic()
+
+        node.timer_callback()
+
+        self.assertGreaterEqual(node._last_colour_frame_at, before)
+
+    def test_explicit_depth_request_retries_after_a_detected_fault(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = _demand_node()
+        node._restart_pipeline = MagicMock(return_value=True)
+        node._depth_unavailable = True
+        msg = MagicMock()
+        msg.data = json.dumps({"depth": True})
+
+        node.camera_config_callback(msg)
+
+        self.assertFalse(node._depth_unavailable)
+        node._restart_pipeline.assert_called_once()
+
+
+@patch("ros_packages.camera.oak_d_lite.stereo.dai")
+@patch("ros_packages.camera.oak_d_lite.stereo.os.path.exists", return_value=True)
+class TestPipelineConstructionOnHardware(unittest.TestCase):
+    """Calls whose correct form was established on the OAK-D Lite itself."""
+
+    def _bare(self):
+        with patch.object(CameraNode, "__init__", lambda self: None):
+            node = CameraNode()
+        node.get_logger = MagicMock()
+        node.queues = {}
+        node.preview_width, node.preview_height = 1280, 720
+        node.current_model_name = "pose_yolo"
+        return node
+
+    def test_aligned_stereo_sets_an_output_size_divisible_by_16(
+        self, mock_exists, mock_dai
+    ):
+        node = self._bare()
+        node.pipeline = MagicMock()
+        stereo = MagicMock()
+        node.pipeline.create.side_effect = lambda kind: (
+            stereo if kind is mock_dai.node.StereoDepth else MagicMock()
+        )
+
+        node._init_stereo_depth()
+
+        stereo.setOutputSize.assert_called_once_with(*stereo_module.DEPTH_OUTPUT_SIZE)
+        width, height = stereo_module.DEPTH_OUTPUT_SIZE
+        self.assertEqual(width % 16, 0)
+        self.assertAlmostEqual(width / height, 2104 / 1560, places=1)
+
+    def test_parsing_network_is_created_by_the_pipeline(self, mock_exists, mock_dai):
+        node = self._bare()
+        node.pipeline = MagicMock()
+        node._get_model_description = MagicMock(return_value="desc")
+        parser_cls = MagicMock(name="ParsingNeuralNetwork")
+        camera = MagicMock()
+
+        with patch.object(
+            stereo_module, "_depthai_nodes_parser", return_value=parser_cls
+        ):
+            node._init_ai(camera)
+
+        # build() on the class itself raised TypeError on the robot.
+        parser_cls.build.assert_not_called()
+        node.pipeline.create.assert_any_call(parser_cls)
+        node.pipeline.create.return_value.build.assert_called_once_with(camera, "desc")
+        self.assertIn("nn", node.queues)
+
+
+@patch("ros_packages.camera.oak_d_lite.stereo.cv2.CascadeClassifier")
+@patch("ros_packages.camera.oak_d_lite.stereo.os.path.exists", return_value=True)
+class TestAiResultFormatting(unittest.TestCase):
+    """Formatters match depthai-nodes 0.5.2 and native ImgDetections."""
+
+    @staticmethod
+    def _point(x, y):
+        return types.SimpleNamespace(x=x, y=y)
+
+    def test_lines_use_start_and_end_points(self, mock_exists, mock_casc):
+        node = _make_node()
+        msg = types.SimpleNamespace(
+            lines=[
+                types.SimpleNamespace(
+                    start_point=self._point(0.1, 0.2),
+                    end_point=self._point(0.3, 0.4),
+                    confidence=0.9,
+                )
+            ]
+        )
+
+        result = node._format_lines(msg)
+
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["lines"][0]["start"], {"x": 0.1, "y": 0.2})
+        self.assertEqual(result["lines"][0]["end"], {"x": 0.3, "y": 0.4})
+        self.assertNotIn("error", result)
+
+    def test_predictions_are_regression_values(self, mock_exists, mock_casc):
+        node = _make_node()
+        msg = types.SimpleNamespace(
+            predictions=[types.SimpleNamespace(prediction=v) for v in (0.25, -1.5)]
+        )
+
+        self.assertEqual(
+            node._format_predictions(msg), {"predictions": [0.25, -1.5], "count": 2}
+        )
+
+    def test_keypoints_message_reads_its_keypoints_list(self, mock_exists, mock_c):
+        node = _make_node()
+        kp = types.SimpleNamespace(
+            imageCoordinates=self._point(0.5, 0.6), confidence=0.7
+        )
+        msg = types.SimpleNamespace(
+            keypoints_list=types.SimpleNamespace(getKeypoints=lambda: [kp])
+        )
+
+        result = node._format_keypoints(msg)
+
+        self.assertEqual(result["keypoints"], [{"x": 0.5, "y": 0.6, "confidence": 0.7}])
+
+    def test_detections_carry_pose_keypoints(self, mock_exists, mock_casc):
+        node = _make_node()
+        kp = types.SimpleNamespace(
+            imageCoordinates=self._point(0.1, 0.9), confidence=1.0
+        )
+        det = types.SimpleNamespace(
+            label=0,
+            confidence=0.8,
+            xmin=0.1,
+            ymin=0.2,
+            xmax=0.3,
+            ymax=0.4,
+            getKeypoints=lambda: [kp],
+        )
+        msg = types.SimpleNamespace(detections=[det])
+
+        result = node._format_detections(msg)
+
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["detections"][0]["keypoints"][0]["x"], 0.1)
+
+    def test_mask_mode_encodes_the_segmentation_mask(self, mock_exists, mock_casc):
+        node = _make_node()
+        node.segmentation_mode = "mask"
+        mask = np.array([[255, 255, 0], [0, 1, 1]], dtype=np.uint8)
+        msg = types.SimpleNamespace(detections=[], getCvSegmentationMask=lambda: mask)
+
+        result = node._format_detections(msg)
+
+        self.assertEqual(result["mask_rle"]["shape"], [2, 3])
+        self.assertEqual(result["mask_rle"]["values"], [255, 0, 1])
+        self.assertEqual(result["mask_rle"]["runs"], [2, 2, 2])
+
+    def test_dispatches_depthai_nodes_messages(self, mock_exists, mock_casc):
+        node = _make_node()
+
+        class Keypoints:
+            keypoints_list = types.SimpleNamespace(getKeypoints=lambda: [])
+
+        class Lines:
+            lines = []
+
+        class Predictions:
+            predictions = []
+
+        with patch.object(
+            stereo_module,
+            "_depthai_nodes_messages",
+            return_value=(Keypoints, Lines, Predictions, type("C", (), {})),
+        ):
+            self.assertIn("keypoints", node._format_ai_result(Keypoints(), "", "", {}))
+            self.assertIn("lines", node._format_ai_result(Lines(), "", "", {}))
+            self.assertIn(
+                "predictions", node._format_ai_result(Predictions(), "", "", {})
+            )
+
+
+@patch("ros_packages.camera.oak_d_lite.stereo.dai")
+@patch("ros_packages.camera.oak_d_lite.stereo.os.path.exists", return_value=True)
+class TestRegistryModelsBuild(unittest.TestCase):
+    """Registry fixes established by running every model on the OAK-D Lite."""
+
+    def _bare(self, model):
+        with patch.object(CameraNode, "__init__", lambda self: None):
+            node = CameraNode()
+        node.get_logger = MagicMock()
+        node.queues = {}
+        node.pipeline = MagicMock()
+        node.current_model_name = model
+        node._get_model_description = MagicMock(return_value="desc")
+        return node
+
+    def test_scrfd_and_yunet_use_the_parsing_network(self, mock_exists, mock_dai):
+        # DetectionNetwork rejects them: no YOLO or SSD detection head.
+        for name, info in AVAILABLE_MODELS.items():
+            if any(k in info["slug"] for k in ("scrfd", "yunet")):
+                self.assertEqual(info["node_type"], "ParsingNeuralNetwork", name)
+
+    def test_multi_head_model_reads_the_synced_outputs(self, mock_exists, mock_dai):
+        node = self._bare("gaze")
+        parsing_node = MagicMock()
+        type(parsing_node).out = property(
+            lambda self: (_ for _ in ()).throw(
+                RuntimeError("Property out is only available ... 2 heads")
+            )
+        )
+        node.pipeline.create.return_value.build.return_value = parsing_node
+
+        with patch.object(
+            stereo_module, "_depthai_nodes_parser", return_value=MagicMock()
+        ):
+            node._init_ai(MagicMock())
+
+        parsing_node.outputs.createOutputQueue.assert_called_once()
+        self.assertIs(
+            node.queues["nn"], parsing_node.outputs.createOutputQueue.return_value
+        )
+
+
+@patch("ros_packages.camera.oak_d_lite.stereo.cv2.CascadeClassifier")
+@patch("ros_packages.camera.oak_d_lite.stereo.os.path.exists", return_value=True)
+class TestMultiHeadFormatting(unittest.TestCase):
+
+    def test_classifications(self, mock_exists, mock_casc):
+        node = _make_node()
+        msg = types.SimpleNamespace(
+            classes=["left", "right"],
+            scores=np.array([0.2, 0.8]),
+            top_class="right",
+            top_score=0.8,
+        )
+
+        self.assertEqual(
+            node._format_classifications(msg),
+            {
+                "classes": ["left", "right"],
+                "scores": [0.2, 0.8],
+                "top_class": "right",
+                "top_score": 0.8,
+            },
+        )
+
+    def test_message_group_formats_each_head(self, mock_exists, mock_casc):
+        node = _make_node()
+
+        class Predictions:
+            def __init__(self, value):
+                self.predictions = [types.SimpleNamespace(prediction=value)]
+
+        class Group:
+            def __init__(self, messages):
+                self._messages = messages
+
+            def getMessageNames(self):
+                return list(self._messages)
+
+            def __getitem__(self, name):
+                return self._messages[name]
+
+        fake_dai = types.SimpleNamespace(
+            ImgDetections=type("D", (), {}), MessageGroup=Group
+        )
+        group = Group({"1": Predictions(-0.5), "0": Predictions(0.25)})
+
+        with (
+            patch.object(stereo_module, "dai", fake_dai),
+            patch.object(
+                stereo_module,
+                "_depthai_nodes_messages",
+                return_value=(
+                    type("K", (), {}),
+                    type("L", (), {}),
+                    Predictions,
+                    type("C", (), {}),
+                ),
+            ),
+        ):
+            result = node._format_ai_result(group, "gaze", "", {})
+
+        self.assertEqual(list(result["heads"]), ["0", "1"])
+        self.assertEqual(result["heads"]["0"]["predictions"], [0.25])
+        self.assertEqual(result["heads"]["1"]["predictions"], [-0.5])
+
+
+class TestKeypointConfidenceSentinel(unittest.TestCase):
+    """YuNet and the hand landmarker report confidence -1 (none available)."""
+
+    def test_negative_confidence_is_omitted(self):
+        kp = types.SimpleNamespace(
+            imageCoordinates=types.SimpleNamespace(x=0.26, y=0.17), confidence=-1.0
+        )
+        source = types.SimpleNamespace(getKeypoints=lambda: [kp])
+
+        self.assertEqual(stereo_module._keypoints(source), [{"x": 0.26, "y": 0.17}])
+
+    def test_real_confidence_is_kept(self):
+        kp = types.SimpleNamespace(
+            imageCoordinates=types.SimpleNamespace(x=0.46, y=0.0), confidence=0.506
+        )
+        source = types.SimpleNamespace(getKeypoints=lambda: [kp])
+
+        self.assertEqual(
+            stereo_module._keypoints(source),
+            [{"x": 0.46, "y": 0.0, "confidence": 0.506}],
+        )
+
+
+class TestRunLengthEncoding(unittest.TestCase):
+
+    @staticmethod
+    def _naive(mask):
+        flat = mask.ravel().tolist()
+        runs, values = [], []
+        for v in flat:
+            if values and values[-1] == v:
+                runs[-1] += 1
+            else:
+                values.append(v)
+                runs.append(1)
+        return {"runs": runs, "values": values, "shape": list(mask.shape)}
+
+    def test_matches_a_reference_encoder(self):
+        rng = np.random.default_rng(7)
+        for shape in [(1, 1), (4, 5), (288, 512)]:
+            mask = rng.integers(0, 3, size=shape).astype(np.uint8)
+            mask[: shape[0] // 2] = 255
+            self.assertEqual(stereo_module.rle_encode(mask), self._naive(mask))
+
+    def test_empty_mask(self):
+        empty = np.zeros((0, 3), dtype=np.uint8)
+        self.assertEqual(
+            stereo_module.rle_encode(empty), {"runs": [], "values": [], "shape": [0, 3]}
+        )
 
 
 class TestModelRegistryConsistency(unittest.TestCase):

@@ -48,8 +48,8 @@ composition-interfaces==1.2.1
 cryptography==3.4.8
 cv-bridge==3.2.1
 dbus-python==1.2.18
-depthai==3.8.0
-depthai-nodes
+depthai==3.6.1
+depthai-nodes==0.5.2
 diagnostic-msgs==4.2.3
 diagnostic-updater==3.1.2
 distlib==0.3.4

@@ -24,7 +24,7 @@ import json
 import os
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import cv2
 import depthai as dai
@@ -66,14 +66,14 @@ AVAILABLE_MODELS = {
         "slug": "luxonis/scrfd-person-detection:25g-640x640",
         "description": "SCRFD Person detector - optimized for people detection",
         "classes": 1,
-        "node_type": "DetectionNetwork",
+        "node_type": "ParsingNeuralNetwork",
     },
     "face": {
         "type": "detection",
         "slug": "luxonis/yunet:640x480",
         "description": "YuNet face detection - fast and reliable",
         "classes": 1,
-        "node_type": "DetectionNetwork",
+        "node_type": "ParsingNeuralNetwork",
     },
     # ============== POSE ESTIMATION ==============
     "pose_yolo": {
@@ -82,7 +82,7 @@ AVAILABLE_MODELS = {
         "description": "YOLOv8 Pose - 17 keypoint body pose",
         "keypoints": 17,
         "node_type": "ParsingNeuralNetwork",
-        "output_type": "ImgDetectionsExtended",
+        "output_type": "ImgDetections",
     },
     "pose_hrnet": {
         "type": "pose",
@@ -107,7 +107,7 @@ AVAILABLE_MODELS = {
         "description": "YOLOv8 Instance Segmentation",
         "classes": 80,
         "node_type": "ParsingNeuralNetwork",
-        "output_type": "ImgDetectionsExtended",
+        "output_type": "ImgDetections",
     },
     # ============== GAZE ESTIMATION ==============
     "gaze": {
@@ -144,35 +144,105 @@ DEFAULT_PIPELINE_CONFIG = {"depth": True, "ai": False, "imu": False}
 # Seconds between attempts to rebuild a pipeline that failed to start.
 PIPELINE_RECOVERY_INTERVAL = 5.0
 
+# DepthAI reconnects a crashed device on its own, so a pipeline can keep
+# reporting itself running while the device resets every few seconds and never
+# delivers a frame. A healthy start produces colour within a fraction of a
+# second; this long without one means the device is not streaming.
+FRAME_WATCHDOG_SECONDS = 8.0
+
+# StereoDepth aligned to the colour camera needs an explicit output size: the
+# ISP stream is 2104 px wide and depth width must be a multiple of 16, or the
+# device rejects the pipeline. 640x480 keeps the ISP stream's 4:3 aspect.
+DEPTH_OUTPUT_SIZE = (640, 480)
+
 
 def rle_encode(mask: np.ndarray) -> Dict[str, Any]:
     """
-    RLE-encode a binary mask for efficient transmission.
-    Much smaller than raw mask data.
+    RLE-encode a mask for efficient transmission.
+
+    Vectorised: segmentation masks are ~150k pixels and arrive with every frame,
+    so a per-pixel Python loop would stall the node's timer.
     """
-    flat = mask.flatten().astype(np.uint8)
-    runs = []
-    values = []
+    shape = list(np.shape(mask))
+    flat = np.asarray(mask).ravel()
+    if flat.size == 0:
+        return {"runs": [], "values": [], "shape": shape}
+    starts = np.concatenate(([0], np.flatnonzero(flat[1:] != flat[:-1]) + 1))
+    runs = np.diff(np.concatenate((starts, [flat.size])))
+    return {
+        "runs": runs.astype(int).tolist(),
+        "values": flat[starts].astype(int).tolist(),
+        "shape": shape,
+    }
 
-    if len(flat) == 0:
-        return {"runs": [], "values": [], "shape": list(mask.shape)}
 
-    current_val = flat[0]
-    run_length = 1
+def _depthai_nodes_parser():
+    """Return depthai-nodes' ParsingNeuralNetwork, or None if unavailable.
 
-    for i in range(1, len(flat)):
-        if flat[i] == current_val:
-            run_length += 1
-        else:
-            runs.append(run_length)
-            values.append(int(current_val))
-            current_val = flat[i]
-            run_length = 1
+    It moved from the package root to depthai_nodes.node between releases.
+    """
+    try:
+        from depthai_nodes.node import ParsingNeuralNetwork
+    except ImportError:
+        try:
+            from depthai_nodes import ParsingNeuralNetwork
+        except ImportError:
+            return None
+    return ParsingNeuralNetwork
 
-    runs.append(run_length)
-    values.append(int(current_val))
 
-    return {"runs": runs, "values": values, "shape": list(mask.shape)}
+def _depthai_nodes_messages():
+    """Return depthai-nodes' (Keypoints, Lines, Predictions, Classifications)."""
+    try:
+        from depthai_nodes.message import (
+            Classifications,
+            Keypoints,
+            Lines,
+            Predictions,
+        )
+    except ImportError:
+        return None
+    return Keypoints, Lines, Predictions, Classifications
+
+
+def _message_group_items(group):
+    """(name, message) pairs of a dai.MessageGroup, ordered by head name."""
+    names = getattr(group, "getMessageNames", None)
+    if callable(names):
+        return [(name, group[name]) for name in sorted(names())]
+    return sorted(group, key=lambda item: item[0])
+
+
+def _is_instance(obj, cls) -> bool:
+    """isinstance() that tolerates a non-type ``cls`` (e.g. a mocked module)."""
+    try:
+        return isinstance(obj, cls)
+    except TypeError:
+        return False
+
+
+def _keypoints(source) -> List[Dict[str, float]]:
+    """Normalised keypoints from an ImgDetection or a KeypointsList."""
+    getter = getattr(source, "getKeypoints", None)
+    if callable(getter):
+        points = []
+        for kp in getter():
+            coords = getattr(kp, "imageCoordinates", kp)
+            point = {"x": round(float(coords.x), 4), "y": round(float(coords.y), 4)}
+            confidence = getattr(kp, "confidence", None)
+            # DepthAI reports -1 when a parser has no per-keypoint confidence.
+            if confidence is not None and confidence >= 0:
+                point["confidence"] = round(float(confidence), 4)
+            points.append(point)
+        return points
+    getter = getattr(source, "getKeypoints2f", None) or getattr(
+        source, "getPoints2f", None
+    )
+    if callable(getter):
+        return [
+            {"x": round(float(p.x), 4), "y": round(float(p.y), 4)} for p in getter()
+        ]
+    return []
 
 
 class ErrorPublisher(Node):
@@ -309,6 +379,8 @@ class CameraNode(Node):
         # waiting for subscriber demand to change.
         self._pipeline_ok = False
         self._next_recovery_attempt = 0.0
+        self._pipeline_started_at = 0.0
+        self._last_colour_frame_at = 0.0
 
         # Depth state. _depth_enabled is the operator override from
         # camera/video/config; _depth_unavailable latches a device that cannot
@@ -338,6 +410,7 @@ class CameraNode(Node):
 
         self.camera_available = self.init_pipeline()
         self._pipeline_ok = self.camera_available
+        self._pipeline_started_at = time.monotonic()
 
         if self.camera_available:
             self.get_camera_image_service = self.create_service(
@@ -534,6 +607,10 @@ class CameraNode(Node):
             self.get_logger().warning(
                 "Depth-to-RGB align unavailable; using native depth."
             )
+        else:
+            # Aligned depth inherits the 2104 px ISP width, which StereoDepth
+            # rejects (width must be a multiple of 16).
+            stereo.setOutputSize(*DEPTH_OUTPUT_SIZE)
 
         mono_left_out = mono_left.requestFullResolutionOutput()
         mono_right_out = mono_right.requestFullResolutionOutput()
@@ -569,27 +646,28 @@ class CameraNode(Node):
             return
 
         if node_type == "ParsingNeuralNetwork":
-            # Complex models with custom parsers (depthai-nodes).
-            try:
-                from depthai_nodes import ParsingNeuralNetwork
-
-                nn = ParsingNeuralNetwork.build(camera_node, model_desc)
-                self.queues["nn"] = nn.out.createOutputQueue(maxSize=4, blocking=False)
+            # Models whose outputs need a custom parser (depthai-nodes).
+            parser = _depthai_nodes_parser()
+            if parser is not None:
+                # A depthai-nodes node is created by the pipeline like any other
+                # node; build() is an instance method, not a factory.
+                nn = self.pipeline.create(parser).build(camera_node, model_desc)
+                try:
+                    stream = nn.out
+                except RuntimeError:
+                    # Multi-head models (hand landmarker, L2CS gaze) have no
+                    # single output; `outputs` syncs all heads into one
+                    # dai.MessageGroup keyed by head index.
+                    stream = nn.outputs
+                self.queues["nn"] = stream.createOutputQueue(maxSize=4, blocking=False)
                 return
-            except ImportError:
-                self.get_logger().error(
-                    "depthai-nodes not installed. "
-                    "Install with: pip install depthai-nodes"
-                )
+            self.get_logger().error(
+                "depthai-nodes not installed; publishing raw network output. "
+                "Install with: pip install depthai-nodes"
+            )
 
-        # Generic NeuralNetwork fallback (also used when depthai-nodes is missing).
-        nn = self.pipeline.create(dai.node.NeuralNetwork)
-        nn.setNNModelDescription(model_desc)
-        nn.input.setBlocking(False)
-        camera_node.requestOutput(
-            (self.preview_width, self.preview_height),
-            type=dai.ImgFrame.Type.BGR888p,
-        ).link(nn.input)
+        # Generic NeuralNetwork: raw tensors, no parsing.
+        nn = self.pipeline.create(dai.node.NeuralNetwork).build(camera_node, model_desc)
         self.queues["nn"] = nn.out.createOutputQueue(maxSize=4, blocking=False)
 
     def _init_imu(self):
@@ -705,6 +783,8 @@ class CameraNode(Node):
 
             self.pipeline_config = config
             self._pipeline_ok = True
+            self._pipeline_started_at = time.monotonic()
+            self._last_colour_frame_at = 0.0
             if not config.get("depth"):
                 # Do not let get_depth_frame serve a frame from a previous build.
                 self.current_depth = None
@@ -735,6 +815,44 @@ class CameraNode(Node):
                 self._publish_status("idle", "AI inactive - no subscribers")
             return ok
 
+    def _check_frame_watchdog(self) -> None:
+        """Treat a pipeline that delivers no colour frames as failed.
+
+        On the OAK-D Lite a mono sensor that will not start crashes the whole
+        device, and DepthAI's automatic reconnect hides that: the pipeline
+        keeps reporting itself running while nothing reaches a queue. So health
+        is judged by frames, and the branch most likely to blame is dropped.
+        """
+        if not self._pipeline_ok or self.queue is None:
+            return
+        last = max(self._pipeline_started_at, self._last_colour_frame_at)
+        if time.monotonic() - last < FRAME_WATCHDOG_SECONDS:
+            return
+
+        silent = f"No colour frame for {FRAME_WATCHDOG_SECONDS:.0f}s"
+        if self.pipeline_config.get("depth"):
+            self.get_logger().error(
+                f"{silent} with stereo depth enabled: the mono sensors are not "
+                "starting (scripts/oak_bringup_check.py isolates why). "
+                "Continuing without depth."
+            )
+            self._depth_unavailable = True
+            self._force_rebuild = True
+        elif self.pipeline_config.get("ai"):
+            self.get_logger().error(
+                f"{silent} after loading model {self.current_model_name}; "
+                "unloading it."
+            )
+            self._ai_failed_model = self.current_model_name
+            self._model_load_error = f"{silent} after loading the model"
+            self._force_rebuild = True
+        else:
+            self.get_logger().error(f"{silent}; rebuilding the pipeline.")
+            self._pipeline_ok = False
+            self._next_recovery_attempt = 0.0
+        # The rebuilt pipeline gets a full grace period of its own.
+        self._pipeline_started_at = time.monotonic()
+
     def check_demand(self):
         """Reconcile the running pipeline with current subscriber demand.
 
@@ -743,6 +861,8 @@ class CameraNode(Node):
         device's SHAVE cores. Unsubscribing gives depth back, so the two modes
         switch on the fly at the cost of one pipeline rebuild (a few seconds).
         """
+        self._check_frame_watchdog()
+
         need_ai = (
             self.ai_pub.get_subscription_count() > 0
             and self.current_model_name != self._ai_failed_model
@@ -949,9 +1069,10 @@ class CameraNode(Node):
         except Exception as e:
             self.get_logger().error(f"Error in check_demand: {e}")
 
-        if self.queue:
+        if self.queue is not None:
             image_rgb = self.queue.tryGet()
             if image_rgb is not None:
+                self._last_colour_frame_at = time.monotonic()
                 frame = image_rgb.getCvFrame()
 
                 if (
@@ -977,7 +1098,7 @@ class CameraNode(Node):
         except Exception as e:
             self.get_logger().error(f"Error processing IMU: {e}")
 
-        if not self.depth_queue:
+        if self.depth_queue is None:
             return
 
         depth_packet = self.depth_queue.tryGet()
@@ -993,205 +1114,143 @@ class CameraNode(Node):
     def _format_ai_result(
         self, in_data, model_type: str, output_type: str, model_info: dict
     ) -> dict:
-        """Format an AI inference result based on model type and output type."""
+        """Format an AI inference result as JSON-serialisable data.
 
-        # Handle DepthAI v3 parsed outputs.
-        if output_type == "ImgDetections" or isinstance(in_data, dai.ImgDetections):
-            # Standard detections.
+        DetectionNetwork and depthai-nodes' YOLO parser (detection, pose and
+        instance segmentation) emit native ImgDetections. depthai-nodes emits
+        its own Keypoints, Lines and Predictions messages for the other models.
+        """
+        if _is_instance(in_data, dai.ImgDetections):
             return self._format_detections(in_data)
 
-        # Try depthai-nodes output types.
-        try:
-            from depthai_nodes.ml.messages import (
-                ImgDetectionsExtended,
-                Keypoints,
-                Lines,
-                Predictions,
-            )
+        if _is_instance(in_data, getattr(dai, "MessageGroup", None)):
+            # One entry per model head, e.g. hand landmarks + handedness.
+            return {
+                "heads": {
+                    name: self._format_ai_result(
+                        message, model_type, output_type, model_info
+                    )
+                    for name, message in _message_group_items(in_data)
+                }
+            }
 
-            if isinstance(in_data, ImgDetectionsExtended):
-                return self._format_detections_extended(in_data, model_info)
-            elif isinstance(in_data, Keypoints):
-                return self._format_keypoints(in_data, model_info)
-            elif isinstance(in_data, Lines):
+        messages = _depthai_nodes_messages()
+        if messages is not None:
+            keypoints_cls, lines_cls, predictions_cls, classifications_cls = messages
+            if _is_instance(in_data, keypoints_cls):
+                return self._format_keypoints(in_data)
+            if _is_instance(in_data, lines_cls):
                 return self._format_lines(in_data)
-            elif isinstance(in_data, Predictions):
-                return self._format_predictions(in_data, model_type)
+            if _is_instance(in_data, predictions_cls):
+                return self._format_predictions(in_data)
+            if _is_instance(in_data, classifications_cls):
+                return self._format_classifications(in_data)
 
-        except ImportError:
-            pass  # depthai-nodes not installed, fall through to raw handling.
-
-        # Fallback: handle based on model_type for raw NeuralNetwork output.
-        if model_type == "detection":
-            return self._format_detections(in_data)
-        elif model_type == "pose":
-            return self._format_pose_raw(in_data, model_info)
-        elif model_type == "instance-segmentation":
-            return self._format_instance_seg_raw(in_data, model_info)
-        elif model_type == "hand":
-            return self._format_hand_raw(in_data, model_info)
-        else:
-            return {"raw": "unsupported model type", "type": model_type}
+        # Raw NeuralNetwork output: depthai-nodes missing or an unparsed model.
+        try:
+            return {"raw_layers": list(in_data.getAllLayerNames()), "type": model_type}
+        except Exception:
+            return {"raw": type(in_data).__name__, "type": model_type}
 
     def _format_detections(self, in_data) -> dict:
-        """Format standard ImgDetections."""
+        """Format ImgDetections, with pose keypoints and masks when present."""
         detections = []
         try:
             for det in in_data.detections:
-                detections.append(
-                    {
-                        "label": det.label,
-                        "confidence": round(det.confidence, 4),
-                        "bbox": {
-                            "xmin": round(det.xmin, 4),
-                            "ymin": round(det.ymin, 4),
-                            "xmax": round(det.xmax, 4),
-                            "ymax": round(det.ymax, 4),
-                        },
-                    }
-                )
-        except Exception as e:
-            return {"error": str(e)}
-
-        return {"detections": detections, "count": len(detections)}
-
-    def _format_detections_extended(self, in_data, model_info: dict) -> dict:
-        """Format ImgDetectionsExtended (detections with keypoints/masks)."""
-        detections = []
-        try:
-            for det in in_data.detections:
-                det_dict = {
+                entry = {
                     "label": det.label,
-                    "confidence": round(det.confidence, 4),
+                    "confidence": round(float(det.confidence), 4),
                     "bbox": {
-                        "xmin": round(det.xmin, 4),
-                        "ymin": round(det.ymin, 4),
-                        "xmax": round(det.xmax, 4),
-                        "ymax": round(det.ymax, 4),
+                        "xmin": round(float(det.xmin), 4),
+                        "ymin": round(float(det.ymin), 4),
+                        "xmax": round(float(det.xmax), 4),
+                        "ymax": round(float(det.ymax), 4),
                     },
                 }
-
-                # Add keypoints if present.
-                if hasattr(det, "keypoints") and det.keypoints:
-                    det_dict["keypoints"] = []
-                    for kp in det.keypoints:
-                        det_dict["keypoints"].append(
-                            {
-                                "x": round(kp.x, 4),
-                                "y": round(kp.y, 4),
-                                "confidence": (
-                                    round(kp.confidence, 4)
-                                    if hasattr(kp, "confidence")
-                                    else 1.0
-                                ),
-                            }
-                        )
-
-                # Add mask if present and requested.
-                if hasattr(det, "mask") and det.mask is not None:
-                    if self.segmentation_mode == "mask":
-                        # RLE encode for efficiency.
-                        mask_array = np.array(det.mask)
-                        det_dict["mask_rle"] = rle_encode(mask_array)
-                    # Always include a mask presence indicator.
-                    det_dict["has_mask"] = True
-
-                detections.append(det_dict)
+                keypoints = _keypoints(det)
+                if keypoints:
+                    entry["keypoints"] = keypoints
+                detections.append(entry)
         except Exception as e:
             return {"error": str(e)}
 
-        return {"detections": detections, "count": len(detections)}
+        result = {"detections": detections, "count": len(detections)}
+        if self.segmentation_mode == "mask":
+            mask = self._segmentation_mask(in_data)
+            if mask is not None:
+                result["mask_rle"] = rle_encode(mask)
+        return result
 
-    def _format_keypoints(self, in_data, model_info: dict) -> dict:
-        """Format Keypoints output."""
+    @staticmethod
+    def _segmentation_mask(in_data) -> Optional[np.ndarray]:
+        """Per-pixel instance mask from an ImgDetections message, if it has one."""
+        for name in ("getCvSegmentationMask", "getSegmentationMask"):
+            getter = getattr(in_data, name, None)
+            if not callable(getter):
+                continue
+            try:
+                mask = getter()
+            except Exception:
+                continue
+            if mask is None:
+                continue
+            if hasattr(mask, "getFrame"):
+                mask = mask.getFrame()
+            mask = np.asarray(mask)
+            if mask.size:
+                return mask
+        return None
+
+    def _format_keypoints(self, in_data) -> dict:
+        """Format a depthai-nodes Keypoints message."""
         try:
-            keypoints_list = []
-            for kp in in_data.keypoints:
-                keypoints_list.append(
-                    {
-                        "x": round(kp.x, 4),
-                        "y": round(kp.y, 4),
-                        "confidence": (
-                            round(kp.confidence, 4)
-                            if hasattr(kp, "confidence")
-                            else 1.0
-                        ),
-                    }
-                )
-            return {"keypoints": keypoints_list, "count": len(keypoints_list)}
+            points = _keypoints(getattr(in_data, "keypoints_list", in_data))
         except Exception as e:
             return {"error": str(e)}
+        return {"keypoints": points, "count": len(points)}
 
     def _format_lines(self, in_data) -> dict:
-        """Format Lines output."""
+        """Format a depthai-nodes Lines message."""
         try:
-            lines_list = []
-            for line in in_data.lines:
-                lines_list.append(
-                    {
-                        "start": {
-                            "x": round(line.start_x, 4),
-                            "y": round(line.start_y, 4),
-                        },
-                        "end": {"x": round(line.end_x, 4), "y": round(line.end_y, 4)},
-                        "confidence": (
-                            round(line.confidence, 4)
-                            if hasattr(line, "confidence")
-                            else 1.0
-                        ),
-                    }
-                )
-            return {"lines": lines_list, "count": len(lines_list)}
+            lines = [
+                {
+                    "start": {
+                        "x": round(float(line.start_point.x), 4),
+                        "y": round(float(line.start_point.y), 4),
+                    },
+                    "end": {
+                        "x": round(float(line.end_point.x), 4),
+                        "y": round(float(line.end_point.y), 4),
+                    },
+                    "confidence": round(float(line.confidence), 4),
+                }
+                for line in in_data.lines
+            ]
         except Exception as e:
             return {"error": str(e)}
+        return {"lines": lines, "count": len(lines)}
 
-    def _format_predictions(self, in_data, model_type: str) -> dict:
-        """Format Predictions output."""
+    def _format_classifications(self, in_data) -> dict:
+        """Format a depthai-nodes Classifications message."""
         try:
-            predictions = []
-            for pred in in_data.predictions:
-                predictions.append(
-                    {"class": pred.label, "confidence": round(pred.confidence, 4)}
-                )
-            return {"predictions": predictions, "count": len(predictions)}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def _format_pose_raw(self, in_data, model_info: dict) -> dict:
-        """Format raw pose estimation output."""
-        try:
-            # Raw NNData handling.
-            layers = in_data.getAllLayerNames()
             return {
-                "raw_layers": layers,
-                "note": "Install depthai-nodes for parsed output",
+                "classes": [str(c) for c in in_data.classes],
+                "scores": [
+                    round(float(v), 4) for v in np.asarray(in_data.scores).ravel()
+                ],
+                "top_class": str(in_data.top_class),
+                "top_score": round(float(in_data.top_score), 4),
             }
         except Exception as e:
             return {"error": str(e)}
 
-    def _format_instance_seg_raw(self, in_data, model_info: dict) -> dict:
-        """Format raw instance segmentation output."""
+    def _format_predictions(self, in_data) -> dict:
+        """Format a depthai-nodes Predictions message (regression outputs)."""
         try:
-            layers = in_data.getAllLayerNames()
-            return {
-                "raw_layers": layers,
-                "note": "Install depthai-nodes for parsed output",
-            }
+            values = [round(float(p.prediction), 4) for p in in_data.predictions]
         except Exception as e:
             return {"error": str(e)}
-
-    def _format_hand_raw(self, in_data, model_info: dict) -> dict:
-        """Format raw hand detection output."""
-        try:
-            if isinstance(in_data, dai.ImgDetections):
-                return self._format_detections(in_data)
-            layers = in_data.getAllLayerNames()
-            return {
-                "raw_layers": layers,
-                "note": "Install depthai-nodes for parsed output",
-            }
-        except Exception as e:
-            return {"error": str(e)}
+        return {"predictions": values, "count": len(values)}
 
     # ============== CONFIG CALLBACKS ==============
 
@@ -1212,6 +1271,11 @@ class CameraNode(Node):
                 "depth_active": self.pipeline_config.get("depth", False),
                 "imu_active": self.pipeline_config.get("imu", False),
                 "pipeline_ok": self._pipeline_ok,
+                "last_frame_age_s": (
+                    round(time.monotonic() - self._last_colour_frame_at, 1)
+                    if self._last_colour_frame_at
+                    else None
+                ),
             }
         )
         self.ai_current_pub.publish(msg_curr)
@@ -1339,8 +1403,12 @@ class CameraNode(Node):
 
             if "depth" in config:
                 wanted = bool(config["depth"])
-                if wanted != self._depth_enabled:
+                retry = wanted and self._depth_unavailable
+                if wanted != self._depth_enabled or retry:
                     self._depth_enabled = wanted
+                    if wanted:
+                        # An explicit request also retries after a detected fault.
+                        self._depth_unavailable = False
                     self.get_logger().info(
                         f"Stereo depth {'enabled' if wanted else 'disabled'} "
                         "by camera/video/config"
