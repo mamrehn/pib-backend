@@ -156,6 +156,20 @@ def test_colour_isp():
     return sample_fresh_device(colour_isp)
 
 
+def monos_only(pipeline):
+    left = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
+    right = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
+    return {
+        "left": left.requestFullResolutionOutput().createOutputQueue(),
+        "right": right.requestFullResolutionOutput().createOutputQueue(),
+    }
+
+
+def test_monos_only():
+    """Both mono sensors with no StereoDepth: the foundation under every depth test."""
+    return sample_fresh_device(monos_only)
+
+
 def test_request_output_with_stereo():
     return sample_fresh_device(lambda p: with_stereo(p, colour_request_output(p)))
 
@@ -211,6 +225,11 @@ PLAN = [
         "documented v3 preview path, 1280x720 scaled on-device",
     ),
     ("colour_isp", test_colour_isp, "the ISP output path stereo.py uses"),
+    (
+        "monos_only",
+        test_monos_only,
+        "both mono sensors on their own, no StereoDepth",
+    ),
     (
         "request_output_with_stereo",
         test_request_output_with_stereo,
@@ -287,6 +306,27 @@ def interpret(status):
             "requestIspOutput() is the fault. stereo.py should request a scaled "
             "output with requestOutput((w, h)) instead."
         )
+    if failed("monos_only"):
+        # Every StereoDepth test needs the monos, so their failures say nothing
+        # about alignment, output sizes or queue handling. Do not guess.
+        hints.append(
+            "The mono sensors do not start even without StereoDepth, so depth is "
+            "unavailable with this camera and DepthAI version. Colour-only runs "
+            "normally. The stereo test failures below follow from this and do "
+            "not point at alignment or output sizes."
+        )
+        rebuild_hints = []
+        if passed("rebuild_documented") and failed("rebuild_like_node"):
+            rebuild_hints.append(
+                "In-process rebuilds need stop() + wait() on an explicit Device; "
+                "stereo.py's current teardown is the fault."
+            )
+        if failed("rebuild_documented") and passed("rebuild_like_node"):
+            rebuild_hints.append(
+                "A second pipeline on one Device crashes; rebuild with a new "
+                "dai.Pipeline() as stereo.py does."
+            )
+        return hints + rebuild_hints
     if passed("colour_isp") and failed("node_pipeline"):
         hints.append(
             "The ISP path works alone but stalls once StereoDepth is aligned to "
@@ -307,11 +347,16 @@ def interpret(status):
             "In-process rebuilds need stop() + wait() on an explicit Device; "
             "stereo.py's current teardown is the fault."
         )
-    if failed("rebuild_documented"):
+    if failed("rebuild_documented") and passed("rebuild_like_node"):
         # colour_request_output passed above, so this is about the rebuild.
         hints.append(
-            "A Device cannot host a second pipeline: rebuilds must close the "
-            "Device and open a new one."
+            "A second pipeline on one Device crashes; rebuild with a new "
+            "dai.Pipeline() as stereo.py does."
+        )
+    if failed("rebuild_documented") and failed("rebuild_like_node"):
+        hints.append(
+            "Neither rebuild pattern survives: rebuilds must close the Device and "
+            "open a new one."
         )
     if all(v == "PASS" for v in status.values()):
         hints.append(
