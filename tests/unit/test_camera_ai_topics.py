@@ -312,6 +312,7 @@ class TestFailedFeatureIsNotRetriedEveryTick(unittest.TestCase):
         request.model_name = "person"
         node.pipeline_config = {"depth": False, "ai": True, "imu": False}
         node.switch_model_callback(request, MagicMock())
+        node.check_demand()  # the next timer tick performs the rebuild
 
         self.assertEqual(node._restart_pipeline.call_count, 2)
         self.assertEqual(node._ai_failed_model, "person")
@@ -951,6 +952,36 @@ class TestKeypointConfidenceSentinel(unittest.TestCase):
         self.assertEqual(
             stereo_module._keypoints(source),
             [{"x": 0.46, "y": 0.0, "confidence": 0.506}],
+        )
+
+
+@patch("ros_packages.camera.oak_d_lite.stereo.cv2.CascadeClassifier")
+@patch("ros_packages.camera.oak_d_lite.stereo.dai")
+@patch("ros_packages.camera.oak_d_lite.stereo.os.path.exists", return_value=True)
+class TestModelSwitchServiceAnswersImmediately(unittest.TestCase):
+    """rosbridge stops waiting for a service response after ~5 s.
+
+    On the robot a switch took ~7 s (teardown plus model load), so the service
+    reported "Timeout exceeded" to web clients although the switch succeeded.
+    """
+
+    def test_switch_returns_before_the_rebuild(self, mock_exists, mock_dai, mock_c):
+        node = _demand_node(ai=1)
+        node.pipeline_config = {"depth": False, "ai": True, "imu": False}
+        node._restart_pipeline = MagicMock(return_value=True)
+        request = MagicMock()
+        request.model_name = "face"
+        response = MagicMock()
+
+        node.switch_model_callback(request, response)
+
+        self.assertTrue(response.success)
+        node._restart_pipeline.assert_not_called()
+        self.assertEqual(node.current_model_name, "face")
+
+        node.check_demand()
+        node._restart_pipeline.assert_called_once_with(
+            {"depth": False, "ai": True, "imu": False}
         )
 
 

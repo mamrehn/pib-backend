@@ -571,17 +571,15 @@ class CameraNode(Node):
         self._publish_status("loading", f"Switching to model {model_name}...")
 
         if self.pipeline_config.get("ai"):
+            # Rebuild on the next timer tick. Loading a model takes several
+            # seconds, longer than rosbridge waits for a service response, so
+            # rebuilding here made every switch look failed to web clients.
+            # Load failures still reach camera/ai/status.
             self._force_rebuild = True
-            self.check_demand()
-
-        if self._model_load_error:
-            response.success = False
-            response.message = f"Model switch failed: {self._model_load_error}"
-            return response
 
         response.success = True
         response.message = (
-            f"Switched to {model_name}. "
+            f"Switching to {model_name}. "
             "Subscribe to camera/ai/status for loading progress."
         )
         return response
