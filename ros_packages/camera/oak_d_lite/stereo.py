@@ -155,6 +155,12 @@ FRAME_WATCHDOG_SECONDS = 8.0
 # device rejects the pipeline. 640x480 keeps the ISP stream's 4:3 aspect.
 DEPTH_OUTPUT_SIZE = (640, 480)
 
+# After the watchdog drops depth, try it once more when colour has run cleanly
+# this long. A camera that was unplugged or swapped looks exactly like mono
+# sensors that will not start, so one retry recovers the former and costs the
+# latter a single short colour gap.
+DEPTH_RETRY_AFTER_SECONDS = 60.0
+
 
 def rle_encode(mask: np.ndarray) -> Dict[str, Any]:
     """
@@ -387,6 +393,11 @@ class CameraNode(Node):
         # provide stereo at all.
         self._depth_enabled = True
         self._depth_unavailable = False
+        # One automatic depth retry after a watchdog drop (see
+        # DEPTH_RETRY_AFTER_SECONDS). _depth_retry_used is refilled as soon as
+        # depth delivers a frame again.
+        self._depth_retry_pending = False
+        self._depth_retry_used = False
 
         # Model state.
         self.current_model_name = DEFAULT_MODEL
@@ -820,6 +831,8 @@ class CameraNode(Node):
         device, and DepthAI's automatic reconnect hides that: the pipeline
         keeps reporting itself running while nothing reaches a queue. So health
         is judged by frames, and the branch most likely to blame is dropped.
+        Silence also follows an unplugged or swapped camera, which is why a
+        dropped depth branch is retried once by _maybe_retry_depth.
         """
         if not self._pipeline_ok or self.queue is None:
             return
@@ -829,13 +842,25 @@ class CameraNode(Node):
 
         silent = f"No colour frame for {FRAME_WATCHDOG_SECONDS:.0f}s"
         if self.pipeline_config.get("depth"):
-            self.get_logger().error(
-                f"{silent} with stereo depth enabled: the mono sensors are not "
-                "starting (scripts/oak_bringup_check.py isolates why). "
-                "Continuing without depth."
-            )
             self._depth_unavailable = True
             self._force_rebuild = True
+            if self._depth_retry_used:
+                self._depth_retry_pending = False
+                self.get_logger().error(
+                    f"{silent} with stereo depth enabled, again after a retry: "
+                    "the mono sensors are not starting "
+                    "(scripts/oak_bringup_check.py isolates why). Depth stays "
+                    'off until re-enabled with {"depth": true} on '
+                    "camera/video/config."
+                )
+            else:
+                self._depth_retry_pending = True
+                self.get_logger().error(
+                    f"{silent} with stereo depth enabled: the mono sensors are "
+                    "not starting, or the camera was disconnected. Continuing "
+                    "without depth; retrying it once after "
+                    f"{DEPTH_RETRY_AFTER_SECONDS:.0f}s of healthy colour."
+                )
         elif self.pipeline_config.get("ai"):
             self.get_logger().error(
                 f"{silent} after loading model {self.current_model_name}; "
@@ -851,6 +876,29 @@ class CameraNode(Node):
         # The rebuilt pipeline gets a full grace period of its own.
         self._pipeline_started_at = time.monotonic()
 
+    def _maybe_retry_depth(self) -> None:
+        """Give stereo depth one more chance after the watchdog dropped it.
+
+        Silence after an unplugged or swapped camera looks exactly like mono
+        sensors that will not start. Once colour has run cleanly for
+        DEPTH_RETRY_AFTER_SECONDS, depth is tried again; if it fails a second
+        time, the watchdog keeps it off until it is explicitly re-enabled.
+        """
+        if not self._depth_retry_pending or not self._pipeline_ok:
+            return
+        now = time.monotonic()
+        if now - self._pipeline_started_at < DEPTH_RETRY_AFTER_SECONDS:
+            return
+        if now - self._last_colour_frame_at >= FRAME_WATCHDOG_SECONDS:
+            return
+        self.get_logger().info(
+            f"Colour ran cleanly for {DEPTH_RETRY_AFTER_SECONDS:.0f}s; "
+            "retrying stereo depth once."
+        )
+        self._depth_retry_pending = False
+        self._depth_retry_used = True
+        self._depth_unavailable = False
+
     def check_demand(self):
         """Reconcile the running pipeline with current subscriber demand.
 
@@ -860,6 +908,7 @@ class CameraNode(Node):
         switch on the fly at the cost of one pipeline rebuild (a few seconds).
         """
         self._check_frame_watchdog()
+        self._maybe_retry_depth()
 
         need_ai = (
             self.ai_pub.get_subscription_count() > 0
@@ -1105,6 +1154,8 @@ class CameraNode(Node):
 
         depth = depth_packet.getFrame()
         self.current_depth = depth
+        # Depth frames mean the mono sensors work: refill the retry budget.
+        self._depth_retry_used = False
         self._publish_colorized_depth(depth)
 
     # ============== AI RESULT FORMATTING ==============
@@ -1269,6 +1320,7 @@ class CameraNode(Node):
                 "depth_active": self.pipeline_config.get("depth", False),
                 "imu_active": self.pipeline_config.get("imu", False),
                 "pipeline_ok": self._pipeline_ok,
+                "depth_retry_pending": self._depth_retry_pending,
                 "last_frame_age_s": (
                     round(time.monotonic() - self._last_colour_frame_at, 1)
                     if self._last_colour_frame_at
@@ -1404,9 +1456,12 @@ class CameraNode(Node):
                 retry = wanted and self._depth_unavailable
                 if wanted != self._depth_enabled or retry:
                     self._depth_enabled = wanted
+                    # An explicit choice replaces any automatic retry plan.
+                    self._depth_retry_pending = False
                     if wanted:
                         # An explicit request also retries after a detected fault.
                         self._depth_unavailable = False
+                        self._depth_retry_used = False
                     self.get_logger().info(
                         f"Stereo depth {'enabled' if wanted else 'disabled'} "
                         "by camera/video/config"

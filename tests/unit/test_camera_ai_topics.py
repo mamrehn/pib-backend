@@ -985,6 +985,186 @@ class TestModelSwitchServiceAnswersImmediately(unittest.TestCase):
         )
 
 
+@patch("ros_packages.camera.oak_d_lite.stereo.cv2.CascadeClassifier")
+@patch("ros_packages.camera.oak_d_lite.stereo.dai")
+@patch("ros_packages.camera.oak_d_lite.stereo.os.path.exists", return_value=True)
+class TestDepthRetryAfterWatchdog(unittest.TestCase):
+    """An unplugged or swapped camera looks like mono sensors that will not start.
+
+    On the robot, swapping cameras made the watchdog switch depth off for good
+    and blame the mono sensors, although both worked.
+    """
+
+    def _node(self):
+        node = _demand_node()
+        node.get_logger = MagicMock()
+
+        def apply(cfg):
+            node.pipeline_config = dict(cfg)
+            node._pipeline_ok = True
+            node._pipeline_started_at = time.monotonic()
+            return True
+
+        node._restart_pipeline = MagicMock(side_effect=apply)
+        node.queue = MagicMock()
+        node.pipeline_config = {"depth": True, "ai": False, "imu": False}
+        return node
+
+    @staticmethod
+    def _silence(node):
+        node._pipeline_ok = True
+        node._last_colour_frame_at = 0.0
+        node._pipeline_started_at = (
+            time.monotonic() - stereo_module.FRAME_WATCHDOG_SECONDS - 1
+        )
+
+    @staticmethod
+    def _healthy_for(node, seconds):
+        now = time.monotonic()
+        node._pipeline_started_at = now - seconds
+        node._last_colour_frame_at = now
+
+    @staticmethod
+    def _errors(node):
+        return " ".join(
+            str(c) for c in node.get_logger.return_value.error.call_args_list
+        )
+
+    def test_first_drop_schedules_one_retry(self, mock_exists, mock_dai, mock_c):
+        node = self._node()
+        self._silence(node)
+
+        node.check_demand()
+
+        self.assertFalse(node.pipeline_config["depth"])
+        self.assertTrue(node._depth_retry_pending)
+        self.assertIn("disconnected", self._errors(node))
+
+    def test_no_retry_before_colour_has_run_long_enough(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = self._node()
+        self._silence(node)
+        node.check_demand()
+        self._healthy_for(node, stereo_module.DEPTH_RETRY_AFTER_SECONDS - 5)
+
+        node.check_demand()
+
+        self.assertFalse(node.pipeline_config["depth"])
+        self.assertTrue(node._depth_retry_pending)
+
+    def test_no_retry_while_colour_is_not_flowing(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = self._node()
+        self._silence(node)
+        node.check_demand()
+        node._pipeline_started_at = (
+            time.monotonic() - stereo_module.DEPTH_RETRY_AFTER_SECONDS - 60
+        )
+        node._last_colour_frame_at = (
+            time.monotonic() - stereo_module.FRAME_WATCHDOG_SECONDS - 1
+        )
+
+        node.check_demand()
+
+        self.assertFalse(node.pipeline_config["depth"])
+        self.assertTrue(node._depth_retry_pending)
+
+    def test_retry_after_clean_colour_rebuilds_with_depth(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = self._node()
+        self._silence(node)
+        node.check_demand()
+        self._healthy_for(node, stereo_module.DEPTH_RETRY_AFTER_SECONDS + 1)
+
+        node.check_demand()
+
+        self.assertTrue(node.pipeline_config["depth"])
+        self.assertFalse(node._depth_retry_pending)
+        self.assertTrue(node._depth_retry_used)
+
+    def test_second_failure_keeps_depth_off(self, mock_exists, mock_dai, mock_c):
+        node = self._node()
+        self._silence(node)
+        node.check_demand()
+        self._healthy_for(node, stereo_module.DEPTH_RETRY_AFTER_SECONDS + 1)
+        node.check_demand()  # the retry
+        self._silence(node)
+
+        node.check_demand()  # fails again
+
+        self.assertFalse(node.pipeline_config["depth"])
+        self.assertFalse(node._depth_retry_pending)
+        self.assertIn("again after a retry", self._errors(node))
+
+        self._healthy_for(node, stereo_module.DEPTH_RETRY_AFTER_SECONDS * 3)
+        node.check_demand()
+        self.assertFalse(node.pipeline_config["depth"])
+
+    def test_depth_frames_refill_the_retry_budget(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = _demand_node()
+        node._depth_retry_used = True
+        node.queue = None
+        packet = MagicMock()
+        packet.getFrame.return_value = np.zeros((2, 2), dtype=np.uint16)
+        node.depth_queue = MagicMock()
+        node.depth_queue.tryGet.return_value = packet
+
+        node.timer_callback()
+
+        self.assertFalse(node._depth_retry_used)
+
+    def test_explicit_depth_choice_resets_the_plan(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        node = self._node()
+        node._depth_unavailable = True
+        node._depth_retry_pending = True
+        node._depth_retry_used = True
+        msg = MagicMock()
+        msg.data = json.dumps({"depth": True})
+
+        node.camera_config_callback(msg)
+
+        self.assertFalse(node._depth_unavailable)
+        self.assertFalse(node._depth_retry_pending)
+        self.assertFalse(node._depth_retry_used)
+
+        node._depth_retry_pending = True
+        msg.data = json.dumps({"depth": False})
+        node.camera_config_callback(msg)
+        self.assertFalse(node._depth_retry_pending)
+
+    def test_missing_stereo_hardware_is_not_retried(
+        self, mock_exists, mock_dai, mock_casc
+    ):
+        with patch.object(CameraNode, "__init__", lambda self: None):
+            node = CameraNode()
+        node.get_logger = MagicMock()
+        node.pipeline_config = {"depth": True, "ai": False, "imu": False}
+        node.current_model_name = "yolov6n"
+        node.current_depth = None
+        node._depth_enabled = True
+        node._depth_unavailable = False
+        node._depth_retry_pending = False
+        node._imu_unavailable = False
+        node._model_loading = False
+        node._model_load_error = None
+        node._ai_failed_model = None
+        node._pipeline_ok = False
+        node._init_stereo_depth = MagicMock(side_effect=RuntimeError("no CAM_B"))
+        mock_dai.Pipeline.return_value = MagicMock()
+
+        node.init_pipeline()
+
+        self.assertTrue(node._depth_unavailable)
+        self.assertFalse(node._depth_retry_pending)
+
+
 class TestRunLengthEncoding(unittest.TestCase):
 
     @staticmethod
