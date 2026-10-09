@@ -1,3 +1,4 @@
+import array
 import io
 import os
 import sys
@@ -16,7 +17,7 @@ from datatypes.srv import PlayAudioFromFile, PlayAudioFromSpeech, ClearPlaybackQ
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Int16MultiArray, String
 
 from pib_hermes_config.turn_taking import clauses_to_synthesize
 from pib_hermes_config.visible_state import (
@@ -155,6 +156,15 @@ class AudioPlayerNode(Node):
             String, "public_api_token", self.get_public_api_token_listener, 10
         )
 
+        # Streamed PCM that is neither a pib-local file nor TTS text, for
+        # example audio produced on a client and forwarded over rosbridge.
+        self.audio_playback_subscription = self.create_subscription(
+            Int16MultiArray,
+            "audio_playback",
+            self.receive_audio_stream_listener,
+            10,
+        )
+
         self.tts_engine = SupertoneTTSEngine()
         self._published_fallback = None
         self.voice_using_fallback_publisher = self.create_publisher(
@@ -166,6 +176,24 @@ class AudioPlayerNode(Node):
     def get_public_api_token_listener(self, msg):
         token = msg.data
         self.token = token
+
+    def receive_audio_stream_listener(self, msg: Int16MultiArray) -> None:
+        """Queue raw PCM received on /audio_playback.
+
+        The samples are signed 16-bit mono and are played with SPEECH_ENCODING,
+        so publishers must send at its rate (SPEECH_ENCODING.frames_per_second,
+        44.1 kHz). Chunks are queued without a pause so consecutive messages
+        play back without gaps, and clear_playback_queue applies to them.
+        """
+        try:
+            data_bytes = array.array("h", msg.data).tobytes()
+        except (TypeError, ValueError, OverflowError) as error:
+            self.get_logger().error(f"Failed to convert audio stream data: {error}")
+            return
+        playback_item = PlaybackItem(
+            [data_bytes], SPEECH_ENCODING, 0.0, self.counter_next()
+        )
+        self.playback_queue.put(playback_item, True)
 
     def counter_next(self) -> int:
         with self.counter_lock:
