@@ -7,15 +7,18 @@ import pytest
 from ros_packages.camera.oak_d_lite.task_archives import (
     COCO_KEYPOINT_NAMES,
     COCO_SKELETON,
+    YOLO26_DETECTION_MODEL_IDS,
+    YOLO26_POSE_MODEL_IDS,
     YOLO26N_MODEL_ID,
-    YOLO26N_POSE_MODEL_ID,
+    YOLO26S_MODEL_ID,
+    YOLO26S_POSE_MODEL_ID,
     YOLOV6N_COCO_LABELS,
     YOLOV6N_MODEL_ID,
     YUNET_MODEL_ID,
     create_archive,
     labels_for_model,
-    yolo26n_archive_config,
-    yolo26n_pose_archive_config,
+    yolo26_detection_archive_config,
+    yolo26_pose_archive_config,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -23,16 +26,16 @@ YUNET_BLOB = (
     REPO_ROOT / "models/face_detection_yunet_160x120/face_detection_yunet_160x120.blob"
 )
 YOLOV6N_BLOB = REPO_ROOT / "models/yolov6n_coco_640x640/yolov6n_coco_640x640.blob"
-YOLO26N_BLOB = REPO_ROOT / "models/yolo26n_coco_512x288/yolo26n_coco_512x288.blob"
-YOLO26N_POSE_BLOB = (
-    REPO_ROOT / "models/yolo26n_pose_coco_512x288/yolo26n_pose_coco_512x288.blob"
-)
+
+
+def _blob(model_id: str) -> Path:
+    return REPO_ROOT / "models" / model_id / f"{model_id}.blob"
 
 
 def _require_blob(path: Path) -> None:
     if not path.is_file():
         pytest.skip(
-            f"{path.name} is not in git; it ships in the models-2026-09-15 release asset"
+            f"{path.name} is not in git; it ships in the model release asset"
         )
 
 
@@ -100,10 +103,12 @@ def _archive_matches_blob(archive, blob):
     assert archive_outputs == blob_outputs
 
 
-def test_real_yolo26n_blob_builds_archive_from_its_tensor_metadata(tmp_path):
-    _require_blob(YOLO26N_BLOB)
-    blob = dai.OpenVINO.Blob(YOLO26N_BLOB)
-    archive = create_archive(YOLO26N_MODEL_ID, YOLO26N_BLOB, tmp_path)
+@pytest.mark.parametrize("model_id", YOLO26_DETECTION_MODEL_IDS)
+def test_real_yolo26_blob_builds_archive_from_its_tensor_metadata(tmp_path, model_id):
+    path = _blob(model_id)
+    _require_blob(path)
+    blob = dai.OpenVINO.Blob(path)
+    archive = create_archive(model_id, path, tmp_path)
 
     assert (archive.getInputWidth(), archive.getInputHeight()) == (512, 288)
     _archive_matches_blob(archive, blob)
@@ -112,13 +117,15 @@ def test_real_yolo26n_blob_builds_archive_from_its_tensor_metadata(tmp_path):
     assert head.metadata.nClasses == 80
     # The one-to-many head: three feature maps, decoded with NMS.
     assert head.metadata.subtype == "yolov8"
-    assert labels_for_model(YOLO26N_MODEL_ID) is YOLOV6N_COCO_LABELS
+    assert labels_for_model(model_id) is YOLOV6N_COCO_LABELS
 
 
-def test_real_yolo26n_pose_blob_builds_archive_with_named_keypoints(tmp_path):
-    _require_blob(YOLO26N_POSE_BLOB)
-    blob = dai.OpenVINO.Blob(YOLO26N_POSE_BLOB)
-    archive = create_archive(YOLO26N_POSE_MODEL_ID, YOLO26N_POSE_BLOB, tmp_path)
+@pytest.mark.parametrize("model_id", YOLO26_POSE_MODEL_IDS)
+def test_real_yolo26_pose_blob_builds_archive_with_named_keypoints(tmp_path, model_id):
+    path = _blob(model_id)
+    _require_blob(path)
+    blob = dai.OpenVINO.Blob(path)
+    archive = create_archive(model_id, path, tmp_path)
 
     assert (archive.getInputWidth(), archive.getInputHeight()) == (512, 288)
     _archive_matches_blob(archive, blob)
@@ -128,14 +135,24 @@ def test_real_yolo26n_pose_blob_builds_archive_with_named_keypoints(tmp_path):
     assert head.metadata.nKeypoints == 17
     extra = head.metadata.extraParams
     assert extra["keypoint_label_names"] == list(COCO_KEYPOINT_NAMES)
-    assert labels_for_model(YOLO26N_POSE_MODEL_ID) == ("person",)
+    assert labels_for_model(model_id) == ("person",)
 
 
 def test_a_blob_with_other_outputs_is_rejected(tmp_path):
-    # The YOLOv6n blob under the YOLO26n id is rejected, not mis-parsed.
+    # The YOLOv6n blob under a YOLO26 id is rejected, not mis-parsed.
     _require_blob(YOLOV6N_BLOB)
     with pytest.raises(ValueError, match="expected"):
-        create_archive(YOLO26N_MODEL_ID, YOLOV6N_BLOB, tmp_path)
+        create_archive(YOLO26S_MODEL_ID, YOLOV6N_BLOB, tmp_path)
+
+
+def test_each_size_keeps_its_own_model_id_in_the_archive(tmp_path):
+    names = set()
+    for model_id in YOLO26_DETECTION_MODEL_IDS + YOLO26_POSE_MODEL_IDS:
+        path = _blob(model_id)
+        _require_blob(path)
+        archive = create_archive(model_id, path, tmp_path)
+        names.add(archive.getConfig().model.metadata.name)
+    assert names == set(YOLO26_DETECTION_MODEL_IDS + YOLO26_POSE_MODEL_IDS)
 
 
 # The archive configs are pure functions of a blob's tensor metadata, so they
@@ -150,7 +167,7 @@ def _fake_blob(inputs, outputs):
     )
 
 
-YOLO26N_TENSORS = (
+YOLO26_TENSORS = (
     {"images": [512, 288, 3, 1]},
     {
         "output3_yolov6r2": [16, 9, 85, 1],
@@ -158,14 +175,14 @@ YOLO26N_TENSORS = (
         "output1_yolov6r2": [64, 36, 85, 1],
     },
 )
-YOLO26N_POSE_TENSORS = (
+YOLO26_POSE_TENSORS = (
     {"images": [512, 288, 3, 1]},
     {"output_yolo26": [6, 3024, 1], "kpt_output": [51, 3024, 1]},
 )
 
 
-def test_yolo26n_config_without_a_blob_parses_three_maps_with_nms():
-    config = yolo26n_archive_config(_fake_blob(*YOLO26N_TENSORS))
+def test_yolo26_config_without_a_blob_parses_three_maps_with_nms():
+    config = yolo26_detection_archive_config(_fake_blob(*YOLO26_TENSORS))
 
     model = config["model"]
     assert model["inputs"][0]["shape"] == [1, 3, 288, 512]
@@ -179,8 +196,8 @@ def test_yolo26n_config_without_a_blob_parses_three_maps_with_nms():
     assert [o["name"] for o in model["outputs"]] == head["outputs"]
 
 
-def test_yolo26n_pose_config_without_a_blob_names_the_keypoints():
-    config = yolo26n_pose_archive_config(_fake_blob(*YOLO26N_POSE_TENSORS))
+def test_yolo26_pose_config_without_a_blob_names_the_keypoints():
+    config = yolo26_pose_archive_config(_fake_blob(*YOLO26_POSE_TENSORS))
 
     [head] = config["model"]["heads"]
     meta = head["metadata"]
@@ -195,8 +212,8 @@ def test_yolo26n_pose_config_without_a_blob_names_the_keypoints():
 
 
 @pytest.mark.parametrize("config_builder,tensors", [
-    (yolo26n_archive_config, YOLO26N_POSE_TENSORS),        # pose blob as detector
-    (yolo26n_pose_archive_config, YOLO26N_TENSORS),        # detector blob as pose
+    (yolo26_detection_archive_config, YOLO26_POSE_TENSORS),  # pose blob as detector
+    (yolo26_pose_archive_config, YOLO26_TENSORS),            # detector blob as pose
 ])
 def test_a_blob_with_the_wrong_outputs_is_rejected_without_the_blob_files(
     config_builder, tensors
@@ -206,10 +223,21 @@ def test_a_blob_with_the_wrong_outputs_is_rejected_without_the_blob_files(
 
 
 def test_a_blob_with_another_input_size_is_rejected():
-    inputs, outputs = YOLO26N_TENSORS
+    inputs, outputs = YOLO26_TENSORS
     with pytest.raises(ValueError, match="input dimensions"):
-        yolo26n_archive_config(_fake_blob({"images": [640, 640, 3, 1]}, outputs))
+        yolo26_detection_archive_config(
+            _fake_blob({"images": [640, 640, 3, 1]}, outputs)
+        )
 
 
-def test_yolo26n_and_yolov6n_share_the_class_order():
-    assert labels_for_model(YOLO26N_MODEL_ID) == labels_for_model(YOLOV6N_MODEL_ID)
+def test_yolo26_and_yolov6n_share_the_class_order():
+    for model_id in YOLO26_DETECTION_MODEL_IDS:
+        assert labels_for_model(model_id) == labels_for_model(YOLOV6N_MODEL_ID)
+
+
+def test_the_small_models_are_listed_first():
+    # Callers that pick "the" YOLO26 model take the first entry: the small one.
+    assert YOLO26_DETECTION_MODEL_IDS[0] == YOLO26S_MODEL_ID
+    assert YOLO26_POSE_MODEL_IDS[0] == YOLO26S_POSE_MODEL_ID
+    assert YOLO26N_MODEL_ID in YOLO26_DETECTION_MODEL_IDS
+

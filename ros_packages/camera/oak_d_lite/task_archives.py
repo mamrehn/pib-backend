@@ -99,19 +99,25 @@ YOLOV6N_COCO_LABELS = (
     "toothbrush",
 )
 
-# Ultralytics YOLO26n, exported by luxonis/tools and compiled with blobconverter
-# (models/README.md). Its 80 COCO classes follow the same order as YOLOv6n's
-# (ultralytics coco.yaml). The detector keeps the one-to-many head: three
+# Ultralytics YOLO26, exported by luxonis/tools and compiled with blobconverter
+# (models/README.md). Their 80 COCO classes follow the same order as YOLOv6n's
+# (ultralytics coco.yaml). The detectors keep the one-to-many head: three
 # "outputN_yolov6r2" maps parsed as subtype yolov8 with NMS, about twice as
 # fast on the RVC2 as the end-to-end head. 512x288 matches the camera's 16:9.
+# The small (s) builds are the default; the nano (n) builds are about twice as
+# fast and less accurate, and stay as a fallback. Both sizes share their
+# outputs, so one config builder serves each task.
+YOLO26_INPUT_SIZE = (512, 288)
+YOLO26_DETECTION_OUTPUTS = ("output1_yolov6r2", "output2_yolov6r2", "output3_yolov6r2")
 YOLO26N_MODEL_ID = "yolo26n_coco_512x288"
-YOLO26N_INPUT_SIZE = (512, 288)
-YOLO26N_OUTPUTS = ("output1_yolov6r2", "output2_yolov6r2", "output3_yolov6r2")
+YOLO26S_MODEL_ID = "yolo26s_coco_512x288"
 
-# The pose model has no NMS head, so it keeps YOLO26's end-to-end outputs.
+# The pose models have no NMS head, so they keep YOLO26's end-to-end outputs.
+YOLO26_POSE_OUTPUTS = ("output_yolo26", "kpt_output")
 YOLO26N_POSE_MODEL_ID = "yolo26n_pose_coco_512x288"
-YOLO26N_POSE_INPUT_SIZE = (512, 288)
-YOLO26N_POSE_OUTPUTS = ("output_yolo26", "kpt_output")
+YOLO26S_POSE_MODEL_ID = "yolo26s_pose_coco_512x288"
+YOLO26_DETECTION_MODEL_IDS = (YOLO26S_MODEL_ID, YOLO26N_MODEL_ID)
+YOLO26_POSE_MODEL_IDS = (YOLO26S_POSE_MODEL_ID, YOLO26N_POSE_MODEL_ID)
 POSE_LABELS = ("person",)
 # The 17 COCO keypoints in the model's order, and the usual skeleton.
 COCO_KEYPOINT_NAMES = (
@@ -372,13 +378,13 @@ def _yolo_archive_config(blob, model_id, size, expected_outputs, head_metadata):
     }
 
 
-def yolo26n_archive_config(blob):
+def yolo26_detection_archive_config(blob, model_id=YOLO26S_MODEL_ID):
     labels = list(YOLOV6N_COCO_LABELS)
     return _yolo_archive_config(
         blob,
-        YOLO26N_MODEL_ID,
-        YOLO26N_INPUT_SIZE,
-        YOLO26N_OUTPUTS,
+        model_id,
+        YOLO26_INPUT_SIZE,
+        YOLO26_DETECTION_OUTPUTS,
         {
             "classes": labels,
             "label_names": labels,
@@ -390,13 +396,13 @@ def yolo26n_archive_config(blob):
     )
 
 
-def yolo26n_pose_archive_config(blob):
+def yolo26_pose_archive_config(blob, model_id=YOLO26S_POSE_MODEL_ID):
     labels = list(POSE_LABELS)
     return _yolo_archive_config(
         blob,
-        YOLO26N_POSE_MODEL_ID,
-        YOLO26N_POSE_INPUT_SIZE,
-        YOLO26N_POSE_OUTPUTS,
+        model_id,
+        YOLO26_INPUT_SIZE,
+        YOLO26_POSE_OUTPUTS,
         {
             "classes": labels,
             "label_names": labels,
@@ -425,16 +431,16 @@ def _cached_archive(blob_path, config_builder, expected_size, cache_dir):
     return archive
 
 
-def create_yolo26n_archive(blob_path, cache_dir=None):
-    return _cached_archive(
-        blob_path, yolo26n_archive_config, YOLO26N_INPUT_SIZE, cache_dir
-    )
+def _yolo26_builder(config_builder, model_id):
+    def build(blob_path, cache_dir=None):
+        return _cached_archive(
+            blob_path,
+            lambda blob: config_builder(blob, model_id),
+            YOLO26_INPUT_SIZE,
+            cache_dir,
+        )
 
-
-def create_yolo26n_pose_archive(blob_path, cache_dir=None):
-    return _cached_archive(
-        blob_path, yolo26n_pose_archive_config, YOLO26N_POSE_INPUT_SIZE, cache_dir
-    )
+    return build
 
 
 def create_yolov6n_archive(blob_path, cache_dir=None):
@@ -454,14 +460,20 @@ def create_yolov6n_archive(blob_path, cache_dir=None):
 _ARCHIVE_BUILDERS = {
     YUNET_MODEL_ID: create_yunet_archive,
     YOLOV6N_MODEL_ID: create_yolov6n_archive,
-    YOLO26N_MODEL_ID: create_yolo26n_archive,
-    YOLO26N_POSE_MODEL_ID: create_yolo26n_pose_archive,
+    **{
+        model_id: _yolo26_builder(yolo26_detection_archive_config, model_id)
+        for model_id in YOLO26_DETECTION_MODEL_IDS
+    },
+    **{
+        model_id: _yolo26_builder(yolo26_pose_archive_config, model_id)
+        for model_id in YOLO26_POSE_MODEL_IDS
+    },
 }
 _MODEL_LABELS = {
     YUNET_MODEL_ID: YUNET_LABELS,
     YOLOV6N_MODEL_ID: YOLOV6N_COCO_LABELS,
-    YOLO26N_MODEL_ID: YOLOV6N_COCO_LABELS,
-    YOLO26N_POSE_MODEL_ID: POSE_LABELS,
+    **{model_id: YOLOV6N_COCO_LABELS for model_id in YOLO26_DETECTION_MODEL_IDS},
+    **{model_id: POSE_LABELS for model_id in YOLO26_POSE_MODEL_IDS},
 }
 
 

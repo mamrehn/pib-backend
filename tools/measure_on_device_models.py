@@ -413,7 +413,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expected-count",
         type=int,
-        default=15,
+        default=11,
         help="abort before starting anything if /list_models differs; 0 disables",
     )
     parser.add_argument(

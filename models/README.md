@@ -307,30 +307,39 @@ for n, t in b.networkInputs.items():
     print(n, t.dataType, list(t.dims))
 ```
 
-## YOLO26n detection and pose (2026-09-28)
+## YOLO26 detection and pose (2026-10-09)
 
-`yolo26n_coco_512x288` and `yolo26n_pose_coco_512x288` are Ultralytics YOLO26n
-and YOLO26n-pose (weights `v8.4.0`, **AGPL-3.0**). luxonis/tools exported them
-to ONNX, and blobconverter compiled them like the zoo blobs above: 4 shaves,
-OpenVINO 2022.1, `-ip U8`. The Luxonis Model Hub does have a YOLO26 Nano, but
-only with the end-to-end head. On an OAK-D Lite that ran at 11-13 inferences/s
-against about 26 for the detector here, whose one-to-many head is parsed with
-NMS on the host.
+Four Ultralytics YOLO26 builds (weights `v8.4.0`, **AGPL-3.0**, the licence
+pib-backend itself carries), all at 512x288, the camera's 16:9. The small (s)
+models are the default; the nano (n) models are about twice as fast and stay as
+a fallback. luxonis/tools exported them to ONNX, and blobconverter compiled them
+like the zoo blobs above: 4 shaves, OpenVINO 2022.1, `-ip U8`. The Luxonis Model
+Hub has a YOLO26 Nano only with the end-to-end head, which ran at 11-13 results/s
+on an OAK-D Lite against about 25 for the one-to-many head with NMS used here.
 
-| model_id | outputs | parser | inf/s* | bus test image |
-| --- | --- | --- | --- | --- |
-| `yolo26n_coco_512x288` | `output{1,2,3}_yolov6r2` (85 × 36×64, 18×32, 9×16) | YOLOExtendedParser `yolov8` | 25.7 | bus 0.83, persons 0.79 / 0.79 / 0.75 |
-| `yolo26n_pose_coco_512x288` | `output_yolo26` 3024×6, `kpt_output` 3024×51 | YOLOExtendedParser `yolo26` | 22.5 | person 0.92, 17 named keypoints |
+| model_id | outputs | parser | COCO mAP50-95† | results/s* | latency* |
+| --- | --- | --- | --- | --- | --- |
+| `yolo26s_coco_512x288` | `output{1,2,3}_yolov6r2` (85 × 36×64, 18×32, 9×16) | YOLOExtendedParser `yolov8` | 48.6 | 12.6 | 223 ms |
+| `yolo26n_coco_512x288` | same | same | 40.9 | 25.2 | 147 ms |
+| `yolo26s_pose_coco_512x288` | `output_yolo26` 3024×6, `kpt_output` 3024×51 | YOLOExtendedParser `yolo26` | 63.0 (pose) | 11.6 | 247 ms |
+| `yolo26n_pose_coco_512x288` | same | same | 57.2 (pose) | 21.9 | 157 ms |
 
-\* Camera → ParsingNeuralNetwork on an OAK-D Lite over a laptop's USB 3 port,
-depthai 3.6.1 and depthai-nodes 0.5.2, with one model running and archives from
-`create_archive`. `yolov6n_coco_640x640` ran at 21.5 in the same setup, against
-11.0 in the robot measurement of `docs/on-device-models.md`, so expect about half
-of these figures on the robot's Raspberry Pi (the host side parses the results).
-The two YOLO26 models have not been measured on a robot.
+† Ultralytics' figures at 640x640; at 512x288 all four are lower, in the same
+order. YOLO26m (53.1 / 68.8) ran at 4.2 results/s with at least 0.5 s latency,
+too slow for anything that moves, so it is not in the store.
+
+\* The camera node's own chain on an OAK-D Lite over a laptop's USB 3 port:
+1152x648 colour branch, ImageManip stretch to 512x288, ParsingNeuralNetwork,
+depthai 3.6.1 and depthai-nodes 0.5.2, one model running. Latency is the age of
+a result when the host receives it, with the network input dropping stale frames
+(`_build_single_network_pipeline`); without that it was 254 / 418 ms for the
+n / s detector. 6 shaves instead of 4 gained only 5-9 %. None of the four has
+been measured on a robot. DepthAI parses both YOLO subtypes on the device (its
+native `DetectionParser`), so the Raspberry Pi only converts and publishes each
+result; the device rate is the ceiling there.
 
 The pose parser names the 17 COCO keypoints (`nose` … `right_ankle`), so
-`Detection.keypoint_names` carries them. The class order of the detector is
+`Detection.keypoint_names` carries them. The class order of the detectors is
 the one `YOLOV6N_COCO_LABELS` lists.
 
 Regenerate on an x86 machine (Python 3.10, CPU torch):
@@ -340,10 +349,12 @@ git clone --recursive https://github.com/luxonis/tools.git && cd tools
 pip install "setuptools>=78.1.1,<82" torch torchvision \
   --extra-index-url https://download.pytorch.org/whl/cpu
 PIP_CONSTRAINT=constraints.txt pip install --no-build-isolation .   # mmcv needs pkg_resources
-curl -LO https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n.pt
-curl -LO https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n-pose.pt
-tools yolo26n.pt --version yolov26_nms --imgsz "512 288" --output-dir out/det
-tools yolo26n-pose.pt --version yolov26 --imgsz "512 288" --output-dir out/pose
+for size in n s; do
+  curl -LO https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26$size.pt
+  curl -LO https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26$size-pose.pt
+  tools yolo26$size.pt --version yolov26_nms --imgsz "512 288" --output-dir out/det_$size
+  tools yolo26$size-pose.pt --version yolov26 --imgsz "512 288" --output-dir out/pose_$size
+done
 ```
 
 ```python
@@ -357,9 +368,11 @@ def compile_yolo(onnx, outputs):
         compile_params=["-ip U8"],
     )
 
-compile_yolo("out/det/<run>/yolo26n.onnx",
-             "output1_yolov6r2,output2_yolov6r2,output3_yolov6r2")
-compile_yolo("out/pose/<run>/yolo26n-pose.onnx", "output_yolo26,kpt_output")
+for size in "ns":
+    compile_yolo(f"out/det_{size}/<run>/yolo26{size}.onnx",
+                 "output1_yolov6r2,output2_yolov6r2,output3_yolov6r2")
+    compile_yolo(f"out/pose_{size}/<run>/yolo26{size}-pose.onnx",
+                 "output_yolo26,kpt_output")
 ```
 
 Copy each blob to `models/<model_id>/<model_id>.blob` and update `sha256` and
@@ -370,20 +383,15 @@ Copy each blob to `models/<model_id>/<model_id>.blob` and update `sha256` and
 Blobs stay out of git (see "Release asset" above), so a change that adds a model
 needs a new release asset. The asset is the whole store, every blob plus
 `manifest.yaml`; build it from an unpacked copy of the previous asset with the
-two new blobs added, using the command in "Produce the tarball" (with the new
-file name and `--mtime`). The recipe reproduces the published
+new blobs added, using the command in "Produce the tarball" (with the new file
+name and `--mtime`). The recipe reproduces the published
 `models-2026-09-15.tar.gz` byte for byte (sha256 `07357ec9...`) from the
-sixteen original blobs and the manifest of PR-1921, so a new asset made this way
-differs from it only in the two added blobs and the manifest.
+sixteen original blobs and the manifest of PR-1921.
 
-Then publish it as a pre-release and point the four values of `setup/setup-pib.sh`
-(`PIB_MODEL_ASSET_TAG`, `PIB_MODEL_ASSET_NAME`, `PIB_MODEL_ASSET_URL`,
-`PIB_MODEL_ASSET_SHA256`) and the table at the top of this file at it. Until a
-robot has the new asset, `setup/setup-pib.sh --models` (and the full install
-and update, which run it) fails with "Model provisioning failed" once this
-branch's manifest is checked out: setup copies `models/manifest.yaml` from the
-repository and requires every entry's blob in the cache with the recorded
-sha256. So the asset must be reachable (`PIB_MODEL_ASSET_URL`, with its
-`PIB_MODEL_ASSET_SHA256`) before this manifest reaches a robot. A robot that
-still runs a checkout without these entries answers `/start_model` for them with
-"Unknown model".
+Setup copies `models/manifest.yaml` from the repository and requires every
+entry's blob in the cache with the recorded sha256. So the asset that carries
+the YOLO26 blobs must be reachable (the defaults in `setup/setup-pib.sh`, or
+`PIB_MODEL_ASSET_URL` with its `PIB_MODEL_ASSET_SHA256`) before this manifest
+reaches a robot; otherwise `setup/setup-pib.sh --models`, the install and the
+update fail with "Model provisioning failed". A robot on a checkout without
+these entries answers `/start_model` for them with "Unknown model".

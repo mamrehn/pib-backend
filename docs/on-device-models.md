@@ -72,7 +72,7 @@ address. `PIB_MODEL_E2E_ROSBRIDGE_URL` still overrides rosbridge.
 
 `tools/measure_on_device_models.py` performs a non-actuating, sequential run of
 the available registry. It refuses to start if the available-entry count is not
-15 (`--expected-count`; 0 disables the check) or if `/list_models` reports an
+11 (`--expected-count`; 0 disables the check) or if `/list_models` reports an
 already-active entry. For every entry it:
 
 1. requests the exact SHAVE count returned by `/list_models`;
@@ -110,9 +110,11 @@ The initial sequential, non-actuating run measured all 14 entries with the
 harness above (`--measure-seconds 8`); every entry was released with
 `/stop_model` before the next one started. The failed gaze entry is now retained
 in `/list_models` as unavailable, so subsequent curated-registry runs measured
-the 13 functional entries; `yolo26n_coco_512x288` and `yolo26n_pose_coco_512x288`
-raised that to 15 and have no row in this table yet (see `models/README.md` for
-their laptop measurement).
+the 13 functional entries. PR-1957 withdrew `facemesh_crop`,
+`facial_landmarks_68_crop` and person re-identification from the list, and the
+four YOLO26 models (`yolo26{s,n}_coco_512x288`, `yolo26{s,n}_pose_coco_512x288`)
+were added, so the list now has 11 entries. The YOLO26 models have no row in this
+table yet (see `models/README.md` for their laptop measurement).
 
 | model_id | shaves | start | final | active | fps | msgs | warn | released | shave basis |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
