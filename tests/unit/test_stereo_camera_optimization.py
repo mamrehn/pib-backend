@@ -580,7 +580,12 @@ class TestSingleNetworkPipeline(unittest.TestCase):
             ],
         )
         parser.build.assert_called_once_with(manip.out, archive)
-        node._relax_branch_input.assert_called_once_with(manip.inputImage)
+        # Both inputs drop stale frames: a network slower than the camera must
+        # not work through a queue of old ones.
+        self.assertEqual(
+            node._relax_branch_input.call_args_list,
+            [unittest.mock.call(manip.inputImage), unittest.mock.call(network.input)],
+        )
         self.assertIn(model.model_id, node.parsed_model_ids)
         network.out.createOutputQueue.assert_called_once_with(
             maxSize=BRANCH_OUTPUT_QUEUE_DEPTH, blocking=False

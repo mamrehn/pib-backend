@@ -1885,6 +1885,10 @@ class CameraNode(Node):
             neural_network = self.pipeline.create(ParsingNeuralNetwork).build(
                 nn_input, archive
             )
+            # A network slower than the camera (the YOLO detectors) otherwise
+            # works through a queue of stale frames: on an OAK-D Lite this
+            # roughly doubled the age of each result at the same rate.
+            self._relax_branch_input(neural_network.input)
             self.parsed_model_ids.add(model.model_id)
         else:
             neural_network = self.pipeline.create(dai.node.NeuralNetwork)
