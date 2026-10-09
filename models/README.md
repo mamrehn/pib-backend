@@ -306,3 +306,84 @@ b = dai.OpenVINO.Blob("/models/<id>/<id>.blob")
 for n, t in b.networkInputs.items():
     print(n, t.dataType, list(t.dims))
 ```
+
+## YOLO26n detection and pose (2026-09-28)
+
+`yolo26n_coco_512x288` and `yolo26n_pose_coco_512x288` are Ultralytics YOLO26n
+and YOLO26n-pose (weights `v8.4.0`, **AGPL-3.0**). luxonis/tools exported them
+to ONNX, and blobconverter compiled them like the zoo blobs above: 4 shaves,
+OpenVINO 2022.1, `-ip U8`. The Luxonis Model Hub does have a YOLO26 Nano, but
+only with the end-to-end head. On an OAK-D Lite that ran at 11-13 inferences/s
+against about 26 for the detector here, whose one-to-many head is parsed with
+NMS on the host.
+
+| model_id | outputs | parser | inf/s* | bus test image |
+| --- | --- | --- | --- | --- |
+| `yolo26n_coco_512x288` | `output{1,2,3}_yolov6r2` (85 × 36×64, 18×32, 9×16) | YOLOExtendedParser `yolov8` | 25.7 | bus 0.83, persons 0.79 / 0.79 / 0.75 |
+| `yolo26n_pose_coco_512x288` | `output_yolo26` 3024×6, `kpt_output` 3024×51 | YOLOExtendedParser `yolo26` | 22.5 | person 0.92, 17 named keypoints |
+
+\* Camera → ParsingNeuralNetwork on an OAK-D Lite over a laptop's USB 3 port,
+depthai 3.6.1 and depthai-nodes 0.5.2, with one model running and archives from
+`create_archive`. `yolov6n_coco_640x640` ran at 21.5 in the same setup, against
+11.0 in the robot measurement of `docs/on-device-models.md`, so expect about half
+of these figures on the robot's Raspberry Pi (the host side parses the results).
+The two YOLO26 models have not been measured on a robot.
+
+The pose parser names the 17 COCO keypoints (`nose` … `right_ankle`), so
+`Detection.keypoint_names` carries them. The class order of the detector is
+the one `YOLOV6N_COCO_LABELS` lists.
+
+Regenerate on an x86 machine (Python 3.10, CPU torch):
+
+```bash
+git clone --recursive https://github.com/luxonis/tools.git && cd tools
+pip install "setuptools>=78.1.1,<82" torch torchvision \
+  --extra-index-url https://download.pytorch.org/whl/cpu
+PIP_CONSTRAINT=constraints.txt pip install --no-build-isolation .   # mmcv needs pkg_resources
+curl -LO https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n.pt
+curl -LO https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n-pose.pt
+tools yolo26n.pt --version yolov26_nms --imgsz "512 288" --output-dir out/det
+tools yolo26n-pose.pt --version yolov26 --imgsz "512 288" --output-dir out/pose
+```
+
+```python
+import blobconverter  # 1.4.3
+
+def compile_yolo(onnx, outputs):
+    return blobconverter.from_onnx(
+        model=onnx, data_type="FP16", shaves=4, version="2022.1",
+        optimizer_params=["--mean_values=[0,0,0]", "--scale_values=[255,255,255]",
+                          "--reverse_input_channels", f"--output={outputs}"],
+        compile_params=["-ip U8"],
+    )
+
+compile_yolo("out/det/<run>/yolo26n.onnx",
+             "output1_yolov6r2,output2_yolov6r2,output3_yolov6r2")
+compile_yolo("out/pose/<run>/yolo26n-pose.onnx", "output_yolo26,kpt_output")
+```
+
+Copy each blob to `models/<model_id>/<model_id>.blob` and update `sha256` and
+`size_bytes` in `manifest.yaml`.
+
+### Shipping them
+
+Blobs stay out of git (see "Release asset" above), so a change that adds a model
+needs a new release asset. The asset is the whole store, every blob plus
+`manifest.yaml`; build it from an unpacked copy of the previous asset with the
+two new blobs added, using the command in "Produce the tarball" (with the new
+file name and `--mtime`). The recipe reproduces the published
+`models-2026-09-15.tar.gz` byte for byte (sha256 `07357ec9...`) from the
+sixteen original blobs and the manifest of PR-1921, so a new asset made this way
+differs from it only in the two added blobs and the manifest.
+
+Then publish it as a pre-release and point the four values of `setup/setup-pib.sh`
+(`PIB_MODEL_ASSET_TAG`, `PIB_MODEL_ASSET_NAME`, `PIB_MODEL_ASSET_URL`,
+`PIB_MODEL_ASSET_SHA256`) and the table at the top of this file at it. Until a
+robot has the new asset, `setup/setup-pib.sh --models` (and the full install
+and update, which run it) fails with "Model provisioning failed" once this
+branch's manifest is checked out: setup copies `models/manifest.yaml` from the
+repository and requires every entry's blob in the cache with the recorded
+sha256. So the asset must be reachable (`PIB_MODEL_ASSET_URL`, with its
+`PIB_MODEL_ASSET_SHA256`) before this manifest reaches a robot. A robot that
+still runs a checkout without these entries answers `/start_model` for them with
+"Unknown model".

@@ -267,6 +267,36 @@ models:
   openvino_version: '2022.1'
   zoo_type: depthai
   notes: YOLOv6n COCO 80-class detector. IR input 'images' 3x640x640. BGR [0-255], compiled '-ip U8'. Decode with DepthAI YoloDetectionNetwork (YOLOv6).
+- model_id: yolo26n_coco_512x288
+  task: object_detection
+  publish_topic: detections/yolo26n_coco_512x288
+  source_upstream: ultralytics/ultralytics (YOLO26n), exported with luxonis/tools
+  source_url: https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n.pt
+  licence: AGPL-3.0; https://github.com/ultralytics/ultralytics/blob/main/LICENSE
+  file: yolo26n_coco_512x288/yolo26n_coco_512x288.blob
+  sha256: 4b372ef8bbdb2cf490f1a5d80ed1faa2ce252e16d96032e41bc5a6cc1a6433b7
+  size_bytes: 5472216
+  shaves: 4
+  input_width: 512
+  input_height: 288
+  format: blob
+  openvino_version: '2022.1'
+  notes: YOLO26n COCO 80-class detector (same class order as yolov6n_coco_640x640). Exported with luxonis/tools --version yolov26_nms, i.e. the one-to-many head as three output{1,2,3}_yolov6r2 maps, parsed as YOLOExtendedParser subtype yolov8 with NMS; about twice as fast on RVC2 as the end-to-end head. IR input 'images' 3x288x512 (16:9). Compiled with blobconverter.from_onnx, mean 0, scale 255, --reverse_input_channels, '-ip U8'. See models/README.md.
+- model_id: yolo26n_pose_coco_512x288
+  task: pose_estimation
+  publish_topic: detections/yolo26n_pose_coco_512x288
+  source_upstream: ultralytics/ultralytics (YOLO26n-pose), exported with luxonis/tools
+  source_url: https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n-pose.pt
+  licence: AGPL-3.0; https://github.com/ultralytics/ultralytics/blob/main/LICENSE
+  file: yolo26n_pose_coco_512x288/yolo26n_pose_coco_512x288.blob
+  sha256: b57b09aa3aa7dbf1d63dd3b6ada5f28fecc06f9d0dee96a162524f722aa4ce4c
+  size_bytes: 6553325
+  shaves: 4
+  input_width: 512
+  input_height: 288
+  format: blob
+  openvino_version: '2022.1'
+  notes: YOLO26n-pose, person class with the 17 COCO keypoints. Exported with luxonis/tools --version yolov26 (end-to-end head, outputs output_yolo26 1x3024x6 and kpt_output 1x3024x51), parsed as YOLOExtendedParser subtype yolo26, which needs depthai-nodes >= 0.5.0. IR input 'images' 3x288x512 (16:9). Compiled with blobconverter.from_onnx, mean 0, scale 255, --reverse_input_channels, '-ip U8'. See models/README.md.
 - model_id: qr_code_detection_384x384
   task: qr_code_detection
   publish_topic: detections/qr_code_detection_384x384

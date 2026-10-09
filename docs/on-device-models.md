@@ -72,7 +72,8 @@ address. `PIB_MODEL_E2E_ROSBRIDGE_URL` still overrides rosbridge.
 
 `tools/measure_on_device_models.py` performs a non-actuating, sequential run of
 the available registry. It refuses to start if the available-entry count is not
-13 or if `/list_models` reports an already-active entry. For every entry it:
+15 (`--expected-count`; 0 disables the check) or if `/list_models` reports an
+already-active entry. For every entry it:
 
 1. requests the exact SHAVE count returned by `/list_models`;
 2. records `/models_status` transitions, active state, and measured FPS;
@@ -108,8 +109,10 @@ passing signal.
 The initial sequential, non-actuating run measured all 14 entries with the
 harness above (`--measure-seconds 8`); every entry was released with
 `/stop_model` before the next one started. The failed gaze entry is now retained
-in `/list_models` as unavailable, so subsequent curated-registry runs measure
-the 13 functional entries.
+in `/list_models` as unavailable, so subsequent curated-registry runs measured
+the 13 functional entries; `yolo26n_coco_512x288` and `yolo26n_pose_coco_512x288`
+raised that to 15 and have no row in this table yet (see `models/README.md` for
+their laptop measurement).
 
 | model_id | shaves | start | final | active | fps | msgs | warn | released | shave basis |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
