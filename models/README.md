@@ -14,20 +14,22 @@ host store to it and does not use the network.
 
 | Field | Value |
 | --- | --- |
-| Asset tag | `model-registry-2026-09-15` |
-| Asset file | `models-2026-09-15.tar.gz` |
-| Default URL | `https://github.com/pib-rocks/pib-backend/releases/download/model-registry-2026-09-15/models-2026-09-15.tar.gz` |
-| Tarball sha256 | `07357ec99e0b91014285aad2e6a03fcd1e6ca95fd7ed686670f7ab73c1f3ff02` |
-| Tarball size | 34581804 bytes |
+| Asset repository | `mamrehn/pib-backend` (the b3 fork) |
+| Asset tag | `model-registry-2026-10-09` |
+| Asset file | `models-2026-10-09.tar.gz` |
+| Default URL | `https://github.com/mamrehn/pib-backend/releases/download/model-registry-2026-10-09/models-2026-10-09.tar.gz` |
+| Tarball sha256 | `ff15fccceaebfa50514881d19a57e6441b3338d4d48f95856efcdd9685a9de1a` |
+| Tarball size | 81588658 bytes |
+| Contents | pib-rocks' `models-2026-09-15.tar.gz` (sixteen blobs, sha256 `07357ec9...`) plus the four YOLO26 blobs |
 
 The archive root matches this directory: `manifest.yaml` plus
 `<model_id>/<model_id>.blob` for each network. It does not contain this
 README or `verify_models.py`.
 
-`setup/setup-pib.sh` reads those four values from `PIB_MODEL_ASSET_TAG`,
-`PIB_MODEL_ASSET_NAME`, `PIB_MODEL_ASSET_URL`, and `PIB_MODEL_ASSET_SHA256`. The
-defaults are the table above, so publishing this file on that tag needs no code
-change. Point the same variables at a mirror or a newer asset when the file moves.
+`setup/setup-pib.sh` reads these values from `PIB_MODEL_ASSET_REPO`,
+`PIB_MODEL_ASSET_TAG`, `PIB_MODEL_ASSET_NAME`, `PIB_MODEL_ASSET_URL`, and
+`PIB_MODEL_ASSET_SHA256`. The defaults are the table above, so publishing this
+file on that tag needs no code change. Point the same variables at a mirror or a newer asset when the file moves.
 
 ### Produce the tarball
 
@@ -38,16 +40,16 @@ make the bytes reproducible; the sha256 above is the result.
 ```bash
 list=$(mktemp)
 find models -name '*.blob' -printf '%P\n' | sort > "$list"
-tar -C models --sort=name --mtime='2026-09-15T00:00:00Z' \
+tar -C models --sort=name --mtime='2026-10-09T00:00:00Z' \
   --owner=0 --group=0 --numeric-owner \
-  -cf - manifest.yaml -T "$list" | gzip -n > models-2026-09-15.tar.gz
+  -cf - manifest.yaml -T "$list" | gzip -n > models-2026-10-09.tar.gz
 rm -f "$list"
-sha256sum models-2026-09-15.tar.gz
+sha256sum models-2026-10-09.tar.gz
 ```
 
 Do not commit the `.blob` files or the tarball. Publish
-`models-2026-09-15.tar.gz` as a GitHub release asset on tag
-`model-registry-2026-09-15`, and mark that release as a **pre-release**: GitHub
+`models-2026-10-09.tar.gz` as a GitHub release asset on tag
+`model-registry-2026-10-09`, and mark that release as a **pre-release**: GitHub
 excludes pre-releases from `releases/latest`, so a data release never becomes the
 repository's latest release and never enters the version pairing guard.
 

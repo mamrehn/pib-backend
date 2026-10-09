@@ -996,9 +996,16 @@ PIB_MODEL_STORE_DEFAULT="/home/pib/app/pib-models"
 # Published as a pre-release: pre-releases are excluded from releases/latest, so
 # this data release never becomes the repository's latest release and never
 # enters the version pairing guard.
-PIB_MODEL_ASSET_TAG_DEFAULT="model-registry-2026-09-15"
-PIB_MODEL_ASSET_NAME_DEFAULT="models-2026-09-15.tar.gz"
-PIB_MODEL_ASSET_SHA256_DEFAULT="07357ec99e0b91014285aad2e6a03fcd1e6ca95fd7ed686670f7ab73c1f3ff02"
+# The b3 fork publishes its own store: pib-rocks' sixteen blobs plus the four
+# YOLO26 models (AGPL-3.0, like this repository). See models/README.md.
+PIB_MODEL_ASSET_REPO_DEFAULT="mamrehn/pib-backend"
+PIB_MODEL_ASSET_TAG_DEFAULT="model-registry-2026-10-09"
+PIB_MODEL_ASSET_NAME_DEFAULT="models-2026-10-09.tar.gz"
+PIB_MODEL_ASSET_SHA256_DEFAULT="ff15fccceaebfa50514881d19a57e6441b3338d4d48f95856efcdd9685a9de1a"
+
+function model_asset_repo() {
+  echo "${PIB_MODEL_ASSET_REPO:-$PIB_MODEL_ASSET_REPO_DEFAULT}"
+}
 
 function model_asset_tag() {
   echo "${PIB_MODEL_ASSET_TAG:-$PIB_MODEL_ASSET_TAG_DEFAULT}"
@@ -1012,18 +1019,20 @@ function model_asset_sha256() {
   echo "${PIB_MODEL_ASSET_SHA256:-$PIB_MODEL_ASSET_SHA256_DEFAULT}"
 }
 
-# Default URL is the GitHub release asset for the tag and name above. Override
-# PIB_MODEL_ASSET_URL, PIB_MODEL_ASSET_TAG, PIB_MODEL_ASSET_NAME, or
-# PIB_MODEL_ASSET_SHA256 when the published file moves; no code change is required.
+# Default URL is the GitHub release asset for the repository, tag and name
+# above. Override PIB_MODEL_ASSET_URL, PIB_MODEL_ASSET_REPO, PIB_MODEL_ASSET_TAG,
+# PIB_MODEL_ASSET_NAME, or PIB_MODEL_ASSET_SHA256 when the published file moves;
+# no code change is required.
 function model_asset_url() {
   if [ -n "${PIB_MODEL_ASSET_URL:-}" ]; then
     echo "$PIB_MODEL_ASSET_URL"
     return
   fi
-  local tag name
+  local repo tag name
+  repo="$(model_asset_repo)"
   tag="$(model_asset_tag)"
   name="$(model_asset_name)"
-  echo "https://github.com/pib-rocks/pib-backend/releases/download/${tag}/${name}"
+  echo "https://github.com/${repo}/releases/download/${tag}/${name}"
 }
 
 function model_blob_cache_dir() {

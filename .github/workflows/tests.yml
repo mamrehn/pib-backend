@@ -38,15 +38,16 @@ jobs:
           python -m pip install -r tests/requirements-camera.txt
       - name: Install model release asset
         # Blobs are not in git. Tests read models/<model_id>/<model_id>.blob.
-        # Tag, name and sha256 are the defaults in setup/setup-pib.sh
-        # (PIB_MODEL_ASSET_TAG_DEFAULT, PIB_MODEL_ASSET_NAME_DEFAULT,
+        # Repository, tag, name and sha256 are the defaults in setup/setup-pib.sh
+        # (PIB_MODEL_ASSET_REPO_DEFAULT, PIB_MODEL_ASSET_TAG_DEFAULT, PIB_MODEL_ASSET_NAME_DEFAULT,
         # PIB_MODEL_ASSET_SHA256_DEFAULT). The archive root is the models/ layout.
         run: |
           set -euo pipefail
-          tag="model-registry-2026-09-15"
-          name="models-2026-09-15.tar.gz"
-          sha="07357ec99e0b91014285aad2e6a03fcd1e6ca95fd7ed686670f7ab73c1f3ff02"
-          url="https://github.com/pib-rocks/pib-backend/releases/download/${tag}/${name}"
+          repo="mamrehn/pib-backend"
+          tag="model-registry-2026-10-09"
+          name="models-2026-10-09.tar.gz"
+          sha="ff15fccceaebfa50514881d19a57e6441b3338d4d48f95856efcdd9685a9de1a"
+          url="https://github.com/${repo}/releases/download/${tag}/${name}"
           archive="$(mktemp)"
           curl -fsSL -o "${archive}" "${url}"
           echo "${sha}  ${archive}" | sha256sum -c -

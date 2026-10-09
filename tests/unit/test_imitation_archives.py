@@ -26,7 +26,7 @@ def _heads(archive):
 def _require_blob(path: Path) -> None:
     if not path.is_file():
         pytest.skip(
-            f"{path.name} is not in git; it ships in the models-2026-09-15 release asset"
+            f"{path.name} is not in git; it ships in the model release asset"
         )
 
 
