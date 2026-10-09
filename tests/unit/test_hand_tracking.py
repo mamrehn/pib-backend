@@ -40,6 +40,7 @@ def test_detection_messages_preserve_pixel_and_depth_contract():
         "float32[] keypoint_x",
         "float32[] keypoint_y",
         "float32[] keypoint_z",
+        "float32[] keypoint_score",
         "string[] scalar_names",
         "float32[] scalar_values",
     ]

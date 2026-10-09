@@ -11,5 +11,6 @@ string[] keypoint_names # e.g. ["wrist","thumb_tip",...] / ["landmark_0",...]; e
 float32[] keypoint_x    # pixels
 float32[] keypoint_y    # pixels
 float32[] keypoint_z    # millimetres, 0 = invalid / unavailable
+float32[] keypoint_score # 0..1 per keypoint; empty when the model reports none
 string[] scalar_names   # e.g. ["yaw_deg","pitch_deg","roll_deg"]; empty if none
 float32[] scalar_values

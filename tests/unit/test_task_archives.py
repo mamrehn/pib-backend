@@ -1,3 +1,4 @@
+import math
 import types
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from ros_packages.camera.oak_d_lite.task_archives import (
     YOLOV6N_MODEL_ID,
     YUNET_MODEL_ID,
     create_archive,
+    keypoint_score_correction,
     labels_for_model,
     yolo26_detection_archive_config,
     yolo26_pose_archive_config,
@@ -241,3 +243,15 @@ def test_the_small_models_are_listed_first():
     assert YOLO26_POSE_MODEL_IDS[0] == YOLO26S_POSE_MODEL_ID
     assert YOLO26N_MODEL_ID in YOLO26_DETECTION_MODEL_IDS
 
+
+@pytest.mark.parametrize("model_id", YOLO26_POSE_MODEL_IDS)
+def test_pose_keypoint_scores_undo_the_parsers_second_sigmoid(model_id):
+    correct = keypoint_score_correction(model_id)
+    sigmoid = lambda x: 1.0 / (1.0 + math.exp(-x))
+    for true_score in (0.0, 0.01, 0.3, 0.5, 0.94, 1.0):
+        assert correct(sigmoid(true_score)) == pytest.approx(true_score, abs=1e-6)
+
+
+def test_other_models_keep_their_keypoint_scores():
+    for model_id in YOLO26_DETECTION_MODEL_IDS + (YOLOV6N_MODEL_ID, YUNET_MODEL_ID):
+        assert keypoint_score_correction(model_id) is None

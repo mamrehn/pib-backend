@@ -55,6 +55,22 @@ def _keypoints(parsed):
     return list(getter()) if callable(getter) else []
 
 
+def _keypoint_scores(keypoints, correction=None):
+    """Each keypoint's confidence 0..1, or an empty list when there is none.
+
+    DepthAI marks a keypoint without a confidence with -1. One such keypoint
+    empties the list, so a consumer never sees scores for only some points.
+    ``correction`` maps a parser's score to the model's own, see
+    ``task_archives.keypoint_score_correction``.
+    """
+    scores = [float(getattr(point, "confidence", -1.0)) for point in keypoints]
+    if any(not 0.0 <= score <= 1.0 for score in scores):
+        return []
+    if correction is not None:
+        scores = [min(1.0, max(0.0, float(correction(score)))) for score in scores]
+    return scores
+
+
 def _scalars(parsed):
     names = list(getattr(parsed, "scalar_names", ()))
     values = [float(value) for value in getattr(parsed, "scalar_values", ())]
@@ -63,13 +79,16 @@ def _scalars(parsed):
     return names, values
 
 
-def translate_detection(parsed, labels, frame_width, frame_height, field=None):
+def translate_detection(
+    parsed, labels, frame_width, frame_height, field=None, keypoint_score=None
+):
     """Translate one normalized parsed detection into pixel coordinates.
 
     ``field`` is ``(origin_x, size_x, origin_y, size_y)`` in published-frame
     pixels: the window the colour branch covers. A fraction of that window
     maps to ``origin + fraction * size``. Omitting it maps each fraction onto
-    the full published frame.
+    the full published frame. ``keypoint_score`` corrects the parser's
+    keypoint confidences (see ``_keypoint_scores``).
     """
     from datatypes.msg import Detection
 
@@ -107,13 +126,18 @@ def translate_detection(parsed, labels, frame_width, frame_height, field=None):
     detection.keypoint_z = [
         float(getattr(point.imageCoordinates, "z", 0.0)) for point in keypoints
     ]
+    detection.keypoint_score = _keypoint_scores(keypoints, keypoint_score)
     detection.scalar_names, detection.scalar_values = _scalars(parsed)
     return detection
 
 
-def translate_detections(packet, labels, frame_width, frame_height, field=None):
+def translate_detections(
+    packet, labels, frame_width, frame_height, field=None, keypoint_score=None
+):
     """Translate all detections carried by a parsed DepthAI packet."""
     return [
-        translate_detection(parsed, labels, frame_width, frame_height, field)
+        translate_detection(
+            parsed, labels, frame_width, frame_height, field, keypoint_score
+        )
         for parsed in packet.detections
     ]

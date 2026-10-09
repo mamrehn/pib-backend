@@ -71,7 +71,11 @@ from .qr_detection import (
     decode_qr_detections,
     validate_qr_blob,
 )
-from .task_archives import create_archive, labels_for_model
+from .task_archives import (
+    create_archive,
+    keypoint_score_correction,
+    labels_for_model,
+)
 from .hand_tracking import (
     HAND_KEYPOINT_NAMES,
     LANDMARK_HANDEDNESS_LAYER,
@@ -959,6 +963,7 @@ class CameraNode(Node):
             frame_width,
             frame_height,
             field,
+            keypoint_score=keypoint_score_correction(model_id),
         )
 
         message = DetectionArray()

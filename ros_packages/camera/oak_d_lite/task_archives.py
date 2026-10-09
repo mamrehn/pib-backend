@@ -1,5 +1,6 @@
 """Build parser archives for selectable single-network tasks."""
 
+import math
 from pathlib import Path
 
 import depthai as dai
@@ -475,6 +476,29 @@ _MODEL_LABELS = {
     **{model_id: YOLOV6N_COCO_LABELS for model_id in YOLO26_DETECTION_MODEL_IDS},
     **{model_id: POSE_LABELS for model_id in YOLO26_POSE_MODEL_IDS},
 }
+
+
+def _undo_sigmoid(score):
+    """The logit: the value that ``score`` is the sigmoid of."""
+    score = min(max(float(score), 1e-6), 1.0 - 1e-6)
+    return math.log(score / (1.0 - score))
+
+
+# DepthAI 3.6.1 parses the YOLO26 heads with its on-device DetectionParser,
+# which applies a sigmoid to the pose keypoints' visibility although the
+# exported head has already applied one. Every score then lies between
+# sigmoid(0) = 0.5 and sigmoid(1) = 0.73. Measured on an OAK-D Lite: the
+# blob's own kpt_output, the ONNX export and Ultralytics agree, and the
+# parsed keypoints carry the sigmoid of their values. The logit undoes the
+# second sigmoid exactly. Drop an entry once DepthAI stops doing this.
+_KEYPOINT_SCORE_CORRECTIONS = {
+    model_id: _undo_sigmoid for model_id in YOLO26_POSE_MODEL_IDS
+}
+
+
+def keypoint_score_correction(model_id):
+    """Function mapping a parsed keypoint confidence to the model's, or None."""
+    return _KEYPOINT_SCORE_CORRECTIONS.get(model_id)
 
 
 def create_archive(model_id, blob_path, cache_dir=None):

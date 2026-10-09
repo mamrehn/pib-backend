@@ -339,8 +339,10 @@ native `DetectionParser`), so the Raspberry Pi only converts and publishes each
 result; the device rate is the ceiling there.
 
 The pose parser names the 17 COCO keypoints (`nose` … `right_ankle`), so
-`Detection.keypoint_names` carries them. The class order of the detectors is
-the one `YOLOV6N_COCO_LABELS` lists.
+`Detection.keypoint_names` carries them, and `Detection.keypoint_score` their
+confidences. DepthAI 3.6.1 applies a second sigmoid to those confidences, which
+`task_archives.keypoint_score_correction` undoes (see there). The class order of
+the detectors is the one `YOLOV6N_COCO_LABELS` lists.
 
 Regenerate on an x86 machine (Python 3.10, CPU torch):
 

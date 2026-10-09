@@ -164,6 +164,11 @@ def _assert_detection_array(message: dict[str, Any]) -> None:
         assert len(detection["keypoint_names"]) == len(detection["keypoint_x"])
         assert len(detection["keypoint_names"]) == len(detection["keypoint_y"])
         assert len(detection["keypoint_names"]) == len(detection["keypoint_z"])
+        assert len(detection.get("keypoint_score", [])) in (
+            0,
+            len(detection["keypoint_names"]),
+        )
+        assert all(0 <= value <= 1 for value in detection.get("keypoint_score", []))
         assert len(detection["scalar_names"]) == len(detection["scalar_values"])
         assert 0 <= detection["score"] <= 1
         assert all(
